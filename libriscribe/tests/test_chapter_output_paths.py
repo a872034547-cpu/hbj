@@ -10,6 +10,7 @@ from libriscribe.web.app import (
     _format_generation_error,
     _resolve_chapter_output_paths,
     _safe_chapter_number,
+    _safe_project_dir_from_paths,
     _safe_section_filename_part,
 )
 
@@ -17,6 +18,16 @@ from libriscribe.web.app import (
 def test_clean_path_text_removes_wrapping_quotes() -> None:
     assert _clean_path_text('"D:/work/project"') == "D:/work/project"
     assert _clean_path_text("'D:/work/project'") == "D:/work/project"
+    assert _clean_path_text(' “D:/work/project” ') == "D:/work/project"
+    assert _clean_path_text('"\'D:/work/project\'"') == "D:/work/project"
+
+
+def test_safe_project_dir_from_paths_uses_parent_when_json_path_was_saved_as_dir(tmp_path: Path) -> None:
+    project_file = tmp_path / "knowledge_base.json"
+
+    project_dir = _safe_project_dir_from_paths(f'"{project_file}"', str(project_file))
+
+    assert project_dir == tmp_path
 
 
 def test_safe_chapter_number_rejects_invalid_values() -> None:
@@ -43,6 +54,17 @@ def test_resolve_chapter_output_paths_uses_project_file_parent_when_project_dir_
     assert project.project_dir == str(tmp_path)
     assert chapter_path == tmp_path / "chapter_2.md"
     assert output_path == tmp_path / "chapter_2_section_2.1_非法_字符.md"
+
+
+def test_resolve_chapter_output_paths_repairs_project_dir_that_points_to_json_file(tmp_path: Path) -> None:
+    project_file = tmp_path / "knowledge_base.json"
+    project = ProjectKnowledgeBase(project_name="path-demo", project_dir=f'"{project_file}"')
+
+    chapter_path, output_path = _resolve_chapter_output_paths(project, str(project_file), 3, "3.1")
+
+    assert project.project_dir == str(tmp_path)
+    assert chapter_path == tmp_path / "chapter_3.md"
+    assert output_path == tmp_path / "chapter_3_section_3.1.md"
 
 
 def test_format_generation_error_distinguishes_filesystem_error() -> None:

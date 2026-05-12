@@ -70,12 +70,12 @@
       "id": "custom_gpt-5.5",
       "name": "gpt-5.5",
       "provider": "custom",
-      "api_base": "https://api.yanyujia.top/v1",
-      "api_key": "sk-Bdg97IVs2v4FijuQiR2iAVa2SdsMpp4l9uVHouoUD6O13s7W",
+      "api_base": "https://hub.linux.do/v1",
+      "api_key": "ah-169297f586e8d625acc89d25de7eda1b05883dc521d2436e9aaa99c1c3f49c66",
       "model": "gpt-5.5",
       "enabled": true,
       "source": "custom",
-      "updated_at": "2026-05-12T01:46:20.923417"
+      "updated_at": "2026-05-12T21:00:14.446164"
     }
   ]
 }

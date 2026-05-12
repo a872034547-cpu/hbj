@@ -698,8 +698,39 @@ def normalize_all_runs(document: DocumentObject) -> None:
 # -----------------------------------------------------------------------------
 
 
+def count_export_words(text: Any) -> int:
+    """统计中英混排导出文本字数：中文按字计，英文/数字按词计。"""
+    plain = clean_text(text)
+    chinese_chars = re.findall(r"[\u4e00-\u9fff]", plain)
+    english_words = re.findall(r"[A-Za-z0-9]+(?:[-'][A-Za-z0-9]+)?", plain)
+    return len(chinese_chars) + len(english_words)
+
+
+def collect_structured_body_text(data: dict[str, Any]) -> str:
+    """收集结构化 JSON 中将被写入 Word 的正文文本，供导出前字数核验。"""
+    parts: list[str] = []
+    parts.extend(iter_paragraph_texts(data.get("preface")))
+    for chapter in data.get("chapters") or []:
+        if not isinstance(chapter, dict):
+            continue
+        parts.extend(iter_paragraph_texts(chapter.get("content")))
+        for section in chapter.get("sections", []) or []:
+            if not isinstance(section, dict):
+                continue
+            parts.extend(iter_paragraph_texts(section.get("content")))
+            for level3 in _level3_items(section):
+                parts.extend(iter_paragraph_texts(level3.get("content")))
+                for level4 in _level4_items(level3):
+                    parts.extend(iter_paragraph_texts(level4.get("content")))
+        parts.extend(normalize_references(chapter.get("references")))
+    parts.extend(iter_paragraph_texts(data.get("conclusion")))
+    parts.extend(normalize_references(data.get("global_references")))
+    return "\n\n".join(part for part in parts if str(part).strip())
+
+
 def export_json_data_to_docx(data: dict[str, Any], output_path: str | Path) -> Path:
-    """把已加载的结构化 JSON 数据导出为 .docx。"""
+    """把已加载的结构化 JSON 数据导出为 .docx，并在函数属性中记录导出前字数。"""
+    export_json_data_to_docx.last_body_word_count = count_export_words(collect_structured_body_text(data))
     output = Path(output_path)
     output.parent.mkdir(parents=True, exist_ok=True)
 
@@ -773,6 +804,9 @@ def export_json_data_to_docx(data: dict[str, Any], output_path: str | Path) -> P
     normalize_all_runs(document)
     document.save(str(output))
     return output
+
+
+export_json_data_to_docx.last_body_word_count = 0
 
 
 def export_json_to_docx(json_path: str | Path, output_path: str | Path | None = None) -> Path:

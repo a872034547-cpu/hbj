@@ -134,7 +134,7 @@ def test_structured_json_formatted_word_export_builds_formal_sections(tmp_path: 
     spec.loader.exec_module(module)
 
     output = tmp_path / "formatted_word.docx"
-    module.export_json_data_to_docx(
+    result = module.export_json_data_to_docx(
         {
             "title": "人工智能赋能高职图书馆阅读推广研究",
             "author": "测试作者",
@@ -166,7 +166,9 @@ def test_structured_json_formatted_word_export_builds_formal_sections(tmp_path: 
         output,
     )
 
+    assert result == output
     assert output.exists()
+    assert module.export_json_data_to_docx.last_body_word_count > 0
     doc = Document(str(output))
     paragraph_texts = [p.text for p in doc.paragraphs]
     assert "目录" in paragraph_texts
@@ -185,6 +187,9 @@ def test_structured_json_formatted_word_export_builds_formal_sections(tmp_path: 
     assert "（一）政策牵引" in paragraph_texts
     assert not any("第1章" in text or "第1节" in text or "1.1" in text for text in paragraph_texts)
     assert not any("https://" in text or "DOI:" in text for text in paragraph_texts)
+    assert "这是四级标题下的正文。" in paragraph_texts
+    assert module.count_export_words("AI 绘画工具生成宣传素材") == 11
+    assert module.collect_structured_body_text({"chapters": [{"sections": [{"level3": [{"level4": [{"content": ["四级正文没有丢失。"]}]}]}]}]}) == "四级正文没有丢失。"
 
     heading_styles = {
         "Book Chapter Heading",

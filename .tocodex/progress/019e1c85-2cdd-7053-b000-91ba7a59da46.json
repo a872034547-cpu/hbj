@@ -1,0 +1,27 @@
+{
+  "taskId": "019e1c85-2cdd-7053-b000-91ba7a59da46",
+  "todos": [
+    {
+      "id": "2ecb1ebc88bbdaf0317a04ba03c2b96a",
+      "content": "定位并修复编号连续性与一致性 0/10 误判",
+      "status": "completed"
+    },
+    {
+      "id": "51187c9098146b726b3d46056c5552ef",
+      "content": "移除导航栏一键生成大纲按钮",
+      "status": "completed"
+    },
+    {
+      "id": "1ca89b3c61f2bb24d875f53cad4e9c4e",
+      "content": "补充/运行相关回归测试",
+      "status": "completed"
+    },
+    {
+      "id": "3ecc33243b16a9361752f76a68ca1024",
+      "content": "记录本次修复备忘并完成说明",
+      "status": "completed"
+    }
+  ],
+  "lastUpdated": 1778602790169,
+  "status": "active"
+}

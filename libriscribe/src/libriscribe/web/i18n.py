@@ -4,6 +4,8 @@ Libriscribe Web UI 国际化模块
 支持中文 (zh) / English (en) 切换
 """
 
+from __future__ import annotations
+
 import streamlit as st
 
 from libriscribe.utils.chinese_labels import format_chapter_label

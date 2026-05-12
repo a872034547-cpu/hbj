@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 """
 Libriscribe Web UI - Streamlit 主应用入口
 
@@ -29,7 +31,7 @@ import time
 import uuid
 from pathlib import Path
 from datetime import datetime
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, Sequence
 
 # ── Libriscribe 核心模块 ──────────────────────────────────────────────
 from libriscribe.knowledge_base import ProjectKnowledgeBase, SourceDocument, EvidenceChunk, Citation
@@ -905,11 +907,18 @@ def _profile_connection_result(profile: dict, test_prompt: str) -> tuple[bool, s
         if not response:
             details = (getattr(client, "last_error", "") or getattr(client, "last_response_preview", "") or "无可用响应预览").strip()
             return False, f"模型接口已调用，但应用未提取到正文。诊断信息：{details[:800]}"
-        lowered = str(response).lower()
+        response_text = str(response).strip()
+        if LLMClient._is_role_marker_only(response_text):
+            preview = response_text[:120]
+            return False, (
+                f"接口只返回了 chat 角色标记“{preview}”，没有真实正文，不能判定为在线可用。"
+                "请检查 API Base、模型名称和中转平台的 OpenAI-compatible /chat/completions 配置。"
+            )
+        lowered = response_text.lower()
         if any(sig in lowered for sig in ("<!doctype html", "<html", "</html>", "<title>", "hublinuxdo")):
-            preview = str(response).strip()[:500]
+            preview = response_text[:500]
             return False, f"接口返回了网页/错误页，不是有效模型响应。请检查 API Base 是否填到了模型接口地址。响应预览：{preview}"
-        return True, str(response).strip()[:500]
+        return True, response_text[:500]
     except Exception as e:
         return False, str(e)
 
@@ -1483,13 +1492,9 @@ def render_sidebar() -> None:
 
             st.divider()
 
-            # ── 写书主线快捷入口 ──
+            # ── 项目快捷操作 ──
             if st.button("保存当前项目", use_container_width=True):
                 save_project()
-
-            if st.button("下一步：生成/整理大纲", type="primary", use_container_width=True, key="sidebar_ai_generate_outline"):
-                st.session_state["current_page"] = "Outline"
-                _generate_outline_with_ai(project)
 
             st.divider()
 
@@ -1554,6 +1559,8 @@ def _export_docx(project: ProjectKnowledgeBase, export_dir: Path) -> None:
         if not chapters:
             st.warning(t('no_chapters_export'))
             return
+        before_words = _export_word_count_from_chapters(chapters)
+        _render_export_word_count_check("DOCX", before_words)
         output_path = export_dir / f"{project.project_name}.docx"
         exporter = DocxExporter()
         exporter.export(
@@ -1564,6 +1571,8 @@ def _export_docx(project: ProjectKnowledgeBase, export_dir: Path) -> None:
             genre=project.genre,
             language=project.language,
         )
+        after_words = _docx_visible_word_count(output_path)
+        _render_export_word_count_check("DOCX", before_words, after_words)
         st.success(t('export_success', fmt='DOCX', path=str(output_path)))
         _render_download_button(output_path, "下载 DOCX 书稿", "application/vnd.openxmlformats-officedocument.wordprocessingml.document")
     except ImportError:
@@ -1667,7 +1676,10 @@ def _project_to_formatted_word_json(project: ProjectKnowledgeBase) -> dict:
         elif part_key == "conclusion":
             structured["conclusion"] = _markdown_blocks_to_paragraphs(content)
         elif part_key == "references":
-            structured["global_references"] = _markdown_blocks_to_paragraphs(content)
+            structured["global_references"] = [
+                paragraph for paragraph in _markdown_blocks_to_paragraphs(content)
+                if not re.fullmatch(r"\s*#*\s*参考文献\s*", paragraph.strip())
+            ]
         elif item.get("number") or item.get("chapter_number"):
             structured["chapters"].append(
                 _markdown_content_to_structured_chapter(content, item.get("display_title") or item.get("title") or "未命名章节")
@@ -1683,8 +1695,13 @@ def _export_formatted_word(project: ProjectKnowledgeBase, export_dir: Path) -> N
         if not data.get("chapters") and not data.get("preface") and not data.get("conclusion"):
             st.warning(t('no_chapters_export'))
             return
+        chapters = _collect_chapters(project)
+        before_words = _export_word_count_from_chapters(chapters)
+        _render_export_word_count_check("Word（带格式）", before_words)
         output_path = export_dir / f"{project.project_name}_格式强控.docx"
         export_json_data_to_docx(data, output_path)
+        after_words = _docx_visible_word_count(output_path)
+        _render_export_word_count_check("Word（带格式）", before_words, after_words)
         st.success(t('export_success', fmt='Word（带格式）', path=str(output_path)))
         _render_download_button(output_path, "下载 Word（带格式）书稿", "application/vnd.openxmlformats-officedocument.wordprocessingml.document")
     except ImportError:
@@ -1786,6 +1803,44 @@ def _count_manuscript_words(text: str) -> int:
     return len(chinese_chars) + len(english_words)
 
 
+def _plain_export_text_from_chapters(chapters: list[dict], *, include_titles: bool = False) -> str:
+    """把待导出的章节列表合并为可统计文本，默认只统计正文内容。"""
+    parts: list[str] = []
+    for chapter in chapters or []:
+        if include_titles:
+            parts.append(str(chapter.get("display_title") or chapter.get("title") or ""))
+        parts.append(str(chapter.get("content") or ""))
+    return "\n\n".join(part for part in parts if part.strip())
+
+
+def _export_word_count_from_chapters(chapters: list[dict]) -> int:
+    """统计导出前正文内容字数。"""
+    return _count_manuscript_words(_plain_export_text_from_chapters(chapters, include_titles=False))
+
+
+def _docx_visible_word_count(output_path: Path) -> int:
+    """读取已生成 DOCX 中可见段落文本字数，用于导出后完整性校验。"""
+    from docx import Document
+
+    doc = Document(str(output_path))
+    visible_text = "\n".join(paragraph.text for paragraph in doc.paragraphs if paragraph.text.strip())
+    return _count_manuscript_words(visible_text)
+
+
+def _render_export_word_count_check(label: str, before_words: int, after_words: Optional[int] = None) -> None:
+    """在导出按钮后展示导出前/导出后字数，并提示正文疑似丢失风险。"""
+    if after_words is None:
+        st.info(f"{label}导出前正文约 {before_words:,} 字。")
+        return
+    delta = after_words - before_words
+    st.info(f"{label}导出前正文约 {before_words:,} 字；导出后可见文本约 {after_words:,} 字；差值 {delta:+,} 字。")
+    # 导出后包含封面、目录、标题和页眉域占位，正常会略高于正文。若明显低于导出前，基本可以判定正文丢失。
+    if before_words >= 100 and after_words < int(before_words * 0.95):
+        st.error(f"{label}导出后字数低于导出前 95%，疑似正文丢失；请勿使用该文件作为最终稿。")
+    else:
+        st.success(f"{label}字数完整性校验通过。")
+
+
 def _safe_int(value: Any, default: int) -> int:
     """把网页控件/会话值安全转换为整数。"""
     try:
@@ -1831,8 +1886,8 @@ def _manuscript_part_generation_options_from_state(part_key: str, fallback: Opti
     elif part_key == "references":
         options["refStartYear"] = _safe_int(state.get("manuscript_part_ref_start_year") or options.get("refStartYear"), 2019)
         options["refEndYear"] = _safe_int(state.get("manuscript_part_ref_end_year") or options.get("refEndYear"), 2026)
-        options["refCount"] = _safe_int(state.get("manuscript_part_ref_count") or options.get("refCount"), 30)
-        options["languageDistribution"] = state.get("manuscript_part_ref_language_distribution") or options.get("languageDistribution") or "中英文各半"
+        options["refCount"] = max(15, min(35, _safe_int(state.get("manuscript_part_ref_count") or options.get("refCount"), 30)))
+        options["languageDistribution"] = state.get("manuscript_part_ref_language_distribution") or options.get("languageDistribution") or "以中文文献为主，可含少量权威英文文献"
         options["citationStyle"] = state.get("manuscript_part_ref_citation_style") or options.get("citationStyle") or "GB/T 7714-2015"
     return options
 
@@ -1872,14 +1927,15 @@ def _truncate_manuscript_part_to_max_words(content: str, max_words: int) -> str:
 
 
 def _sanitize_generated_manuscript_part(part_key: str, content: str) -> str:
-    """清理 AI 生成的专著组成部分：去标题词、去自检字数报告。"""
+    """清理 AI 生成的专著组成部分：去自检字数报告；参考文献保留规定标题。"""
     cleaned = _sanitize_export_manuscript_content(content)
     if part_key == "preface":
         cleaned = _strip_manuscript_part_title(cleaned, "前言")
     elif part_key == "conclusion":
         cleaned = _strip_manuscript_part_title(cleaned, "结语")
     elif part_key == "references":
-        cleaned = _strip_manuscript_part_title(cleaned, "参考文献")
+        stripped = _strip_manuscript_part_title(cleaned, "参考文献")
+        cleaned = "参考文献\n\n" + stripped if stripped else "参考文献"
     cleaned = re.sub(r"【\s*实际字数\s*[：:]\s*\d+\s*】", "", cleaned)
     cleaned = re.sub(r"^\s*实际字数\s*[：:]\s*\d+\s*$", "", cleaned, flags=re.MULTILINE)
     return cleaned.strip()
@@ -2556,10 +2612,9 @@ def render_outline_page() -> None:
             remaining = parent_words - explicit
             if remaining <= 0:
                 remaining = parent_words
-            base = max(1, remaining // len(missing))
-            remainder = max(0, remaining - base * len(missing))
-            for idx, child in enumerate(missing):
-                child.word_count = base + (1 if idx < remainder else 0)
+            targets = _semantic_word_targets([getattr(sec, "title", "") or getattr(sec, "summary", "") for sec in missing], remaining)
+            for child, target in zip(missing, targets):
+                child.word_count = int(target)
                 changed = True
 
         parents = sorted(
@@ -2676,6 +2731,106 @@ def render_outline_page() -> None:
             st.rerun()
 
 
+def _semantic_outline_weight(text: str, position: int = 0, total: int = 1) -> float:
+    """根据标题与写作思路估算强对比语义权重，避免父级字数机械平均分配。"""
+    raw = str(text or "").strip()
+    if not raw:
+        return 1.0
+
+    normalized = re.sub(r"\s+", "", raw)
+    normalized = re.sub(r"[（(]\s*(?:约\s*)?(?:总字数\s*)?\d+\s*字?\s*[）)]", "", normalized)
+    normalized = re.sub(r"写作思路[：:]", "", normalized)
+    length_weight = min(0.72, max(0.0, len(normalized) - 4) / 28)
+    score = 1.0 + length_weight
+
+    # 字数分配要让“机制/治理/路径/风险/实证”等正文承重单元明显高于概念性铺垫。
+    high_value_keywords = {
+        "机制": 0.42,
+        "机理": 0.42,
+        "体系": 0.40,
+        "模型": 0.38,
+        "治理": 0.38,
+        "评价": 0.36,
+        "评估": 0.34,
+        "路径": 0.34,
+        "策略": 0.34,
+        "方案": 0.32,
+        "实施": 0.32,
+        "应用": 0.30,
+        "实践": 0.30,
+        "转化": 0.30,
+        "数据": 0.30,
+        "数字": 0.28,
+        "实证": 0.34,
+        "案例": 0.26,
+        "问题": 0.30,
+        "困境": 0.30,
+        "瓶颈": 0.30,
+        "原因": 0.26,
+        "影响": 0.28,
+        "协同": 0.28,
+        "风险": 0.32,
+        "安全": 0.28,
+        "质量": 0.26,
+        "创新": 0.24,
+        "演进": 0.20,
+        "比较": 0.20,
+        "偏好": 0.18,
+        "课外": 0.16,
+    }
+    light_keywords = {
+        "概念": 0.18,
+        "定义": 0.18,
+        "概述": 0.18,
+        "导论": 0.22,
+        "简介": 0.22,
+        "基本内涵": 0.16,
+        "背景": 0.10,
+        "基础": 0.10,
+        "小结": 0.28,
+        "结语": 0.28,
+    }
+    for keyword, bonus in high_value_keywords.items():
+        if keyword in normalized:
+            score += bonus
+    for keyword, penalty in light_keywords.items():
+        if keyword in normalized:
+            score -= penalty
+
+    if total > 1:
+        # 仅用于同质短标题打破完全均分，不允许位置覆盖语义。
+        score += min(0.04, max(0, position) * 0.012)
+    return max(0.42, score)
+
+
+def _semantic_word_targets(items: Sequence[str], total_words: int) -> list[int]:
+    """按语义权重把 total_words 分配给若干小节，并保证整数结果总和严格守恒。"""
+    count = len(items or [])
+    total_words = int(total_words or 0)
+    if count <= 0:
+        return []
+    if total_words <= 0:
+        return [0 for _ in range(count)]
+
+    base_weights = [_semantic_outline_weight(item, idx, count) for idx, item in enumerate(items)]
+    # 对语义分值做非线性放大，让复杂承重小节与概念铺垫之间拉开 20%~60% 的差距。
+    weights = [max(0.18, weight) ** 1.42 for weight in base_weights]
+    weight_sum = sum(weights) or float(count)
+    raw_targets = [total_words * weight / weight_sum for weight in weights]
+    targets = [int(value) for value in raw_targets]
+    remainder = total_words - sum(targets)
+    if remainder > 0:
+        ranked = sorted(range(count), key=lambda idx: (raw_targets[idx] - targets[idx], weights[idx]), reverse=True)
+        for idx in ranked[:remainder]:
+            targets[idx] += 1
+    elif remainder < 0:
+        ranked = sorted(range(count), key=lambda idx: (raw_targets[idx] - targets[idx], weights[idx]))
+        for idx in ranked[:abs(remainder)]:
+            if targets[idx] > 0:
+                targets[idx] -= 1
+    return targets
+
+
 def _normalize_outline_text(text: str) -> str:
     """规范化 AI/粘贴大纲：把一整段输出切成可解析的章-节行。"""
     if not text:
@@ -2747,7 +2902,7 @@ def _parse_outline_text(project: ProjectKnowledgeBase, text: str, *, persist: bo
         return 0
 
     def _assign_parent_word_counts_to_leaf_sections(sections: list[ChapterSection]) -> None:
-        """将带字数的父级节平均分配给后代小节，UI 和写作叶子都能看到目标字数。"""
+        """将带字数的父级节按标题语义权重分配给后代小节，避免机械平均。"""
         if not sections:
             return
 
@@ -2780,10 +2935,12 @@ def _parse_outline_text(project: ProjectKnowledgeBase, text: str, *, persist: bo
             remaining_words = parent_word_count - explicit_child_words
             if remaining_words <= 0:
                 remaining_words = parent_word_count
-            base_words = max(1, remaining_words // len(missing_children))
-            remainder = max(0, remaining_words - base_words * len(missing_children))
-            for idx, child in enumerate(missing_children):
-                child.word_count = base_words + (1 if idx < remainder else 0)
+            targets = _semantic_word_targets(
+                [getattr(sec, "title", "") or getattr(sec, "summary", "") for sec in missing_children],
+                remaining_words,
+            )
+            for child, target in zip(missing_children, targets):
+                child.word_count = int(target)
 
         # 自上而下给直接子级补齐字数：这样“第一节”下的“一、”在大纲管理 UI 中也不再显示 0。
         parent_sections = sorted(
@@ -4070,6 +4227,18 @@ def render_editor_page() -> None:
             ("写作单元", f"{sum(1 for sec in getattr(chapter, 'sections', []) if getattr(sec, 'status', '') == 'completed')} / {len(getattr(chapter, 'sections', []) or [])}"),
         ]
         st.markdown("　".join(f"**{name}：** {value}" for name, value in status_items))
+        chapter_strength_prompt = st.text_area(
+            "本章强化提示词（单章/小节生成前生效）",
+            height=130,
+            key=f"chapter_strength_prompt_{selected_ch_num}",
+            placeholder=(
+                "可填写本章特别要求，例如：强化职业教育场景、减少政策口号、增加图书馆实践机制分析、"
+                "避免泛泛讨论等。该提示词只作用于当前章和本章小节生成。"
+            ),
+            help="自定义要求会注入章节写作提示词，但不能覆盖资料真实性、正文输出边界和语言规范。",
+        )
+        if chapter_strength_prompt.strip():
+            st.caption("已为当前章启用强化提示词；点击“AI 写作”或“生成此小节”时会一并生效。")
 
     # 操作按钮
     col_save, col_ai, col_review, col_opt, col_visual, col_book = st.columns(6)
@@ -4085,7 +4254,7 @@ def render_editor_page() -> None:
             save_project()
     with col_ai:
         if st.button(t('ai_write'), use_container_width=True, key="ai_write"):
-            _generate_chapter_with_ai(project, selected_ch_num)
+            _generate_chapter_with_ai(project, selected_ch_num, chapter_strength_prompt)
     with col_review:
         if st.button(t('ai_review'), use_container_width=True, key="ai_review"):
             _review_chapter_with_ai(project, selected_ch_num)
@@ -4229,9 +4398,9 @@ def render_editor_page() -> None:
                         )
                     with ref_col3:
                         generation_options["refCount"] = st.number_input(
-                            "建议文献数量",
-                            min_value=1,
-                            max_value=200,
+                            "参考文献总数量（15-35条）",
+                            min_value=15,
+                            max_value=35,
                             value=30,
                             step=1,
                             key="manuscript_part_ref_count",
@@ -4240,7 +4409,7 @@ def render_editor_page() -> None:
                     with ref_col4:
                         generation_options["languageDistribution"] = st.text_input(
                             "文献语种分布",
-                            value="中英文各半",
+                            value="以中文文献为主，可含少量权威英文文献",
                             key="manuscript_part_ref_language_distribution",
                         )
                     with ref_col5:
@@ -4326,7 +4495,7 @@ def render_editor_page() -> None:
                     st.write(f"**RAG Query:** {sec.rag_query}")
                 if is_leaf:
                     if st.button("生成此小节", key=f"ai_write_section_{selected_ch_num}_{sec.section_number}"):
-                        _generate_section_with_ai(project, selected_ch_num, sec.section_number)
+                        _generate_section_with_ai(project, selected_ch_num, sec.section_number, chapter_strength_prompt)
                 else:
                     st.caption("此标题用于组织下级小节，生成章节时会按目录顺序写作其下内容。")
     else:
@@ -4372,11 +4541,33 @@ def render_editor_page() -> None:
 
 
 def _clean_path_text(value: Any) -> str:
-    """清理从 session/project JSON 读取的路径文本，兼容误带引号的 Windows 路径。"""
-    text = str(value or "").strip()
-    if len(text) >= 2 and text[0] == text[-1] and text[0] in {'"', "'"}:
-        text = text[1:-1].strip()
-    return text
+    """清理从 session/project JSON 读取的路径文本，兼容误带引号/空白的 Windows 路径。"""
+    text = str(value or "").strip().strip("\ufeff")
+    quote_pairs = {'"': '"', "'": "'", "“": "”", "‘": "’", "《": "》", "「": "」", "『": "』"}
+    changed = True
+    while changed and len(text) >= 2:
+        changed = False
+        for left, right in quote_pairs.items():
+            if text.startswith(left) and text.endswith(right):
+                text = text[1:-1].strip()
+                changed = True
+                break
+    return text.strip()
+
+
+def _safe_project_dir_from_paths(project_dir_value: Any, project_file: str = "") -> Path:
+    """从项目目录/项目文件推导可写目录，避免把 JSON 文件或带引号路径当成目录。"""
+    project_dir_text = _clean_path_text(project_dir_value)
+    project_file_text = _clean_path_text(project_file)
+    if project_dir_text:
+        project_dir = Path(project_dir_text)
+        if project_dir.name.lower() == "knowledge_base.json" or project_dir.suffix.lower() == ".json":
+            project_dir = project_dir.parent
+    elif project_file_text:
+        project_dir = Path(project_file_text).parent
+    else:
+        raise ValueError("项目目录为空，无法构造章节输出路径。")
+    return project_dir
 
 
 def _safe_chapter_number(chapter_num: Any) -> int:
@@ -4413,12 +4604,8 @@ def _resolve_chapter_output_paths(project: ProjectKnowledgeBase, project_file: s
     先规范化项目目录、章节号和小节临时文件名，可以避免把文件系统错误误判为模型错误。
     """
     normalized_chapter = _safe_chapter_number(chapter_num)
-    project_dir_text = _clean_path_text(getattr(project, "project_dir", ""))
-    if not project_dir_text:
-        project_dir_text = str(Path(_clean_path_text(project_file)).parent)
-        project.project_dir = project_dir_text
-
-    project_dir = Path(project_dir_text).expanduser()
+    project_dir = _safe_project_dir_from_paths(getattr(project, "project_dir", ""), project_file)
+    project.project_dir = str(project_dir)
     try:
         project_dir.mkdir(parents=True, exist_ok=True)
     except OSError as exc:
@@ -4434,6 +4621,8 @@ def _resolve_chapter_output_paths(project: ProjectKnowledgeBase, project_file: s
 
     try:
         output_path.parent.mkdir(parents=True, exist_ok=True)
+        if output_path.exists() and output_path.is_dir():
+            raise OSError(f"章节输出路径是目录而不是文件：{output_path}")
     except OSError as exc:
         raise OSError(f"章节输出目录不可写：{output_path.parent}。原始错误：{exc}") from exc
     return chapter_path, output_path
@@ -4547,10 +4736,11 @@ def _bg_write_chapter(project_file: str, chapter_num: int, provider: str,
         if project is None:
             return "ERROR: 无法加载项目数据"
 
-        # 确保 project_dir 存在
-        if not project.project_dir:
-            project.project_dir = str(Path(project_file).parent)
-            project.save_to_file(project_file)
+        # 确保 project_dir 存在且不是误写入的 knowledge_base.json 文件路径。
+        normalized_project_dir = _safe_project_dir_from_paths(getattr(project, "project_dir", ""), project_file)
+        if str(getattr(project, "project_dir", "")) != str(normalized_project_dir):
+            project.project_dir = str(normalized_project_dir)
+            project.save_to_file(_clean_path_text(project_file))
 
         # 创建 LLM 客户端：来自统一模型档案的 provider/base/key/model
         client = LLMClient(llm_provider=provider, api_base=api_base, api_key=api_key, model=model)
@@ -4605,7 +4795,7 @@ def _bg_write_chapter(project_file: str, chapter_num: int, provider: str,
         return "ERROR: ChapterWriter 模块不可用"
     except Exception as e:
         logger.exception("Background chapter generation failed")
-        return f"ERROR: {e}"
+        return f"ERROR: {_format_generation_error(e)}"
 
 
 def _bg_write_book(project_file: str, provider: str, api_base: str = "", api_key: str = "",
@@ -4702,19 +4892,18 @@ def _bg_review_chapter(project_file: str, chapter_num: int, provider: str,
         return f"ERROR: {e}"
 
 
-def _run_live_chapter_generation(project: ProjectKnowledgeBase, chapter_num: int, section_number: str = "") -> None:
+def _run_live_chapter_generation(project: ProjectKnowledgeBase, chapter_num: int, section_number: str = "", chapter_strength_prompt: str = "") -> None:
     """在当前页面实时生成章节/小节，展示动态正文预览；错误不会写入正文文件。"""
     client = get_llm_client()
     if client is None:
         return
 
-    project_file = st.session_state.get("project_file")
+    project_file = _clean_path_text(st.session_state.get("project_file"))
     if not project_file:
         st.error("项目文件路径未找到，请重新加载项目。")
         return
 
-    if not project.project_dir:
-        project.project_dir = str(Path(project_file).parent)
+    project.project_dir = str(_safe_project_dir_from_paths(getattr(project, "project_dir", ""), project_file))
 
     profile = _resolve_project_model_profile(project)
     if profile is None:
@@ -4803,6 +4992,7 @@ def _run_live_chapter_generation(project: ProjectKnowledgeBase, chapter_num: int
             section_number=section_number or None,
             progress_callback=progress_callback,
             content_callback=content_callback,
+            chapter_strength_prompt=chapter_strength_prompt,
         )
 
         if section_number and output_path.exists():
@@ -4837,14 +5027,14 @@ def _run_live_chapter_generation(project: ProjectKnowledgeBase, chapter_num: int
         st.toast("生成失败，错误未写入正文", icon="⚠️")
 
 
-def _generate_chapter_with_ai(project: ProjectKnowledgeBase, chapter_num: int) -> None:
+def _generate_chapter_with_ai(project: ProjectKnowledgeBase, chapter_num: int, chapter_strength_prompt: str = "") -> None:
     """使用 AI 实时生成章节内容。"""
-    _run_live_chapter_generation(project, chapter_num)
+    _run_live_chapter_generation(project, chapter_num, chapter_strength_prompt=chapter_strength_prompt)
 
 
-def _generate_section_with_ai(project: ProjectKnowledgeBase, chapter_num: int, section_number: str) -> None:
+def _generate_section_with_ai(project: ProjectKnowledgeBase, chapter_num: int, section_number: str, chapter_strength_prompt: str = "") -> None:
     """使用 AI 实时生成指定小节。"""
-    _run_live_chapter_generation(project, chapter_num, section_number)
+    _run_live_chapter_generation(project, chapter_num, section_number, chapter_strength_prompt=chapter_strength_prompt)
 
 
 def _manuscript_part_chapter_overview(project: ProjectKnowledgeBase) -> str:
@@ -4987,39 +5177,94 @@ def _build_manuscript_part_prompt(
 - 绝对禁止：字数统计、自评、评分、附录、术语表、任何分隔标记。
 """
 
-    return f"""【系统指令】
-你是一名学术参考文献整理专家。你的唯一任务是为给定的专著生成“参考文献”列表。输出必须仅是参考文献列表本身，不包含任何其他内容。
+    ref_start_year = int(options.get('refStartYear') or 2019)
+    ref_end_year = int(options.get('refEndYear') or 2026)
+    ref_count = max(15, min(35, int(options.get('refCount') or 30)))
+    citation_style = options.get('citationStyle') or 'GB/T 7714-2015'
+    language_distribution = options.get('languageDistribution') or '以中文文献为主，可含少量权威英文文献'
+    return f"""你是一名学术参考文献整理与校验专家。
+你的唯一任务是为给生成的文章专著整理一批中文参考文献。
+你输出的内容必须是纯参考文献列表，不包含任何其他信息。
 
 【任务参数】
 - 专著名称：{book_title}
 - 所属学科/领域：{field}
-- 引用文献时间范围：严格限制为 {int(options.get('refStartYear') or 2019)} 年至 {int(options.get('refEndYear') or 2026)} 年（含边界）
-- 建议文献数量：约 {int(options.get('refCount') or 30)} 条
-- 文献语种分布：{options.get('languageDistribution') or '中英文各半'} （例如“中英文各半”）
-- 文献类型偏好：以期刊论文、学术专著、重要政策文件为主，不列报纸、一般网络文章
+- 参考文献总数量：{ref_count} 条（控制在15-35条之间）
+- 文献语种分布：{language_distribution}（以中文文献为主；可含少量权威英文文献，但必须以中文为主）
+- 出版/发表时间范围：严格限制为 {ref_start_year} 年至 {ref_end_year} 年
+- 参考文献格式：{citation_style}
 
 【全书结构概览】
 {chapters}
 
 {common_context}
 
+【平台已有引用与资料上下文】
 {_manuscript_part_citation_context(project)}
 
-【格式要求】
-- 采用 {options.get('citationStyle') or 'GB/T 7714-2015'} 格式（如 GB/T 7714-2015、APA 7th 等）。
-- 每条文献单独一行，中文文献在前、英文文献在后；每条以 `[序号] 作者. 题名[文献类型标识]. 出版地: 出版者, 年份.` 或 `[序号] 作者. 题名[J]. 刊名, 年, 卷(期): 页码.` 这类专著通用参考文献格式输出。
-- 不得在文献末尾附加 DOI、URL、OpenAlex、网页链接或 `https://` 链接；如果原始记录含链接，只作为内部核验依据，不写入最终参考文献。
+【文献类型构成要求】
+1. 必须以 M 类文献（专著、图书）为主体，占到总条目的 80% 以上。
+2. 可以辅以少量期刊论文（[J]）、学位论文（[D]）、会议论文（[C]）等，但期刊论文必须是能够在知网（cnki.net）公开检索到的。
+3. 禁止包含报纸文章（[N]）、一般网络文章（[EB/OL]）、标准（[S]）、专利（[P]）等非学术核心文献。
 
-【真实性约束】
-- 你必须只在确信某篇文献真实存在、且发表在要求的时间范围内时，才将其列入。
-- 任何你不确定、可能为虚构的文献，直接跳过，不要尝试生成。
-- 优先整理平台已有可核验引用记录、资料库来源和已导入的 OpenAlex/DOI/链接文献；资料不足时输出“暂无足够可核验参考文献，请先在资料与检索页导入或粘贴参考文献。”。
+【真实性硬性约束 - 不可违反】
+1. 你列出的每一条文献，都必须是真实存在的出版物。严禁编造、杜撰、拼凑任何文献。
+2. 对于 M 类文献（专著/图书）：
+   - 必须在条目中完整著录：作者、书名、出版地、出版社、出版年份。
+   - 出版社和出版年份必须是该专著实际对应的准确信息，不可随意匹配。
+   - 如果你对某本书的出版社或出版年份不确定，直接跳过，不列该条目。
+3. 对于期刊论文（[J]）：
+   - 必须能够在中国知网（cnki.net）通过篇名或作者检索到。
+   - 必须在条目中完整著录：作者、篇名、期刊名、年、卷、期、起止页码。
+   - 如果某篇论文你无法确认是否被知网收录，直接跳过。
+4. 对于其他类型文献（如论文集[C]、学位论文[D]），同样要求真实可查。
+
+【生成策略】
+- 你必须在内部进行“可验证性自检”：对每一篇拟输出的文献，确认自己有极高把握它是真实存在的，且出版信息准确。不确定的条目一律舍弃。
+- 为保证真实性，宁可少列几篇，也绝不用不确定的条目凑数。
+- 优先使用平台已有可核验引用记录、资料库来源和已导入的 OpenAlex/DOI/链接文献；但只有确认满足上述类型、年份、格式和真实性要求时才可列入。
+- 如果某个主题下真实存在的文献确实不足以达到请求数量，可以诚实减少输出条目，并在列表末尾用一行“（说明：经校验后确信存在的相关文献共计X条）”，但这一行说明之后不能再添加任何其他文字。
 
 【输出规则】
-- 直接输出参考文献条目列表；不得输出“参考文献”四个字标题。
-- 不输出任何解释、总结、引言。
-- 绝对禁止：字数统计、自评、评分、附录说明、分隔标记、DOI 链接、URL 链接、`https://` 链接。
+1. 输出第一行是“参考文献”四个字（作为标题），空一行后逐条列出参考文献。
+2. 每条文献单独一行，按作者姓氏拼音排序，中文文献在前，英文文献在后。
+3. 正文结束后直接结束，不留任何额外字符、空行或表情符号。
+4. 绝对禁止在正文前后或中间输出以下内容：
+   - 字数统计、自评、评分
+   - 任何过程说明（如“以下是符合要求的文献”）
+   - 术语表、附录
+   - 分隔标记或装饰线
 """
+
+
+def _friendly_llm_generation_error(part_title: str, error: Exception, client: Optional[LLMClient] = None) -> str:
+    """把模型接口错误转换成用户能直接处理的网页提示。"""
+    details = " | ".join(
+        part for part in [
+            str(error or "").strip(),
+            str(getattr(client, "last_error", "") or "").strip() if client is not None else "",
+            str(getattr(client, "last_response_preview", "") or "").strip()[:500] if client is not None else "",
+        ]
+        if part
+    )
+    normalized = details.lower()
+    if any(code in normalized for code in ("401", "invalid api key", "unauthorized")):
+        reason = "API Key 无效或已失效"
+        action = "请到「模型设置」重新填写并测试 API Key。"
+    elif any(code in normalized for code in ("422", "model not found", "not found")):
+        reason = "当前模型名称不可用或供应商不支持"
+        action = "请到「模型设置」把模型名改为该接口真实支持的模型后再测试。"
+    elif any(code in normalized for code in ("429", "too many requests", "rate limit")):
+        reason = "模型接口限流或额度不足"
+        action = "请稍后重试，或切换到可用额度更高的模型档案。"
+    elif any(code in normalized for code in ("504", "524", "gateway timeout", "timeout", "timed out")):
+        reason = "模型接口超时"
+        action = "本次已快速停止，避免页面一直转圈；请降低文献数量、切换模型，或先用「资料与检索」里的 OpenAlex 生成真实引用。"
+    else:
+        reason = "模型接口未返回有效内容"
+        action = "请检查模型配置、网络和供应商状态后重试。"
+    detail_suffix = f"\n\n接口返回：{details[:800]}" if details else ""
+    return f"生成{part_title}失败：{reason}。{action}{detail_suffix}"
 
 
 def _generate_manuscript_part_with_ai(
@@ -5042,8 +5287,14 @@ def _generate_manuscript_part_with_ai(
         options = _manuscript_part_generation_options_from_state(part_key, options)
         prompt = _build_manuscript_part_prompt(project, part_key, requirement, options)
         target_words = _target_word_count_for_part(part_key, options)
-        with st.spinner(f"AI 正在生成{MANUSCRIPT_PARTS[part_key]['title']}…"):
-            content = client.generate_content(prompt, max_tokens=6000, temperature=0.25)
+        part_title = MANUSCRIPT_PARTS[part_key]['title']
+        generation_kwargs: dict[str, Any] = {"max_tokens": 6000, "temperature": 0.25}
+        if part_key == "references":
+            generation_kwargs.update({"max_tokens": 2800, "temperature": 0.2, "timeout_seconds": 45, "raw_attempt_limit": 2})
+        with st.spinner(f"AI 正在生成{part_title}…"):
+            content = client.generate_content(prompt, **generation_kwargs)
+        if not content and getattr(client, "last_error", ""):
+            raise RuntimeError(getattr(client, "last_error"))
         cleaned = _sanitize_generated_manuscript_part(part_key, str(content or "").strip())
         if part_key in {"preface", "conclusion"} and target_words:
             min_words = int(target_words * 0.92)
@@ -5085,7 +5336,7 @@ def _generate_manuscript_part_with_ai(
         st.rerun()
     except Exception as e:
         logger.exception("Generate manuscript part failed: %s", part_key)
-        st.error(f"生成{MANUSCRIPT_PARTS[part_key]['title']}失败：{e}")
+        st.error(_friendly_llm_generation_error(MANUSCRIPT_PARTS[part_key]['title'], e, client))
 
 def _generate_book_with_ai(project: ProjectKnowledgeBase) -> None:
     """前台逐章生成全书：实时显示当前章，避免后台任务看起来“没有作用”。"""
@@ -5093,13 +5344,12 @@ def _generate_book_with_ai(project: ProjectKnowledgeBase) -> None:
     if client is None:
         return
 
-    project_file = st.session_state.get("project_file")
+    project_file = _clean_path_text(st.session_state.get("project_file"))
     if not project_file:
         st.error("项目文件路径未找到，请重新加载项目。")
         return
 
-    if not project.project_dir:
-        project.project_dir = str(Path(project_file).parent)
+    project.project_dir = str(_safe_project_dir_from_paths(getattr(project, "project_dir", ""), project_file))
 
     if not project.chapters:
         st.warning("当前项目没有可生成的章节，请先在大纲页创建章节。")

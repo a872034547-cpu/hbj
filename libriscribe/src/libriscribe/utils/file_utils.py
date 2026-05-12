@@ -1,5 +1,7 @@
 # src/libriscribe/utils/file_utils.py
 
+from __future__ import annotations
+
 import json
 import os
 from typing import Dict, Any, Optional, Type, TypeVar, Union, List

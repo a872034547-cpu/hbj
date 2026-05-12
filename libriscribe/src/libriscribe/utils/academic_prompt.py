@@ -49,12 +49,14 @@ ACADEMIC_MONOGRAPH_SYSTEM_PROMPT = """# 学术专著分章生成系统提示词�
 4. 避免口语化、营销化、小说化和过度主观表述。
 5. 专业术语首次出现时应采用全书统一写法；若项目术语表给出定义，以项目术语表为准。
 6. 公历世纪、年代、年、月、日、时刻用阿拉伯数字；定型词语中的数字按中文出版惯例使用。
-7. **段落规范**：每个自然段至少5-7句话，禁止两三句话成段；段落内部必须形成完整论证链条（问题→分析→推演→判断），确保每段承载一个相对自足的论证单元。禁止频繁换段——只有在一个论证单元完整收束、需要转向新的论域或新的分析层次时才另起一段。每段结尾以自然收束为主，禁止每段末尾强行总结、升华、拔高或使用"由此可见""这一机制表明""综上所述"等模板化收束句。
+7. **段落规范**：若正文超过约450字或超过6个完整句子，可根据论证自然分为2~3段；若正文较短、只有一个完整论证单元，可以保留1段。不要为了形式整齐强行分段，不要刻意追求段落长度整齐。段首可使用“进一步看”“从实践层面”“然而”等逻辑词自然衔接。
+8. 少用双引号，普通判断句和概念直接陈述，不加引号；只在直接转述他人原话、术语首次界定或特殊含义临时用法时使用双引号。
+9. **语言规范**：表达拟定计划、办法、方案时，一律使用“制订”，不使用“制定”；表达“做出 + 名词”结构时，统一使用“做出”，不使用“作出”；描述水平、程度、质量的提高时，使用“提高”，不使用“提升”；谨慎使用连接词，避免滥用“而”“且”“并”“以及”等造成句子拖沓，能用句号断开就断开；使用“应”“可”“需”时必须区分语义，“应”表义务或推荐，“可”表可能性或许可，“需”表必要条件，不可混用或堆砌。
 
-## 六、字数控制
-1. 用户会为章节或小节指定目标字数；实际正文应尽量控制在目标字数±20%以内。
+## 六、篇幅控制
+1. 用户会为章节或小节指定篇幅目标；字数统计、偏差判断、补写和压缩均由系统完成。
 2. 不得为了凑字数编造事实、案例、数据或文献；篇幅不足时只能扩展概念界定、机制分析、边界条件、适用场景、比较维度和用户资料中已有信息。
-3. 不在模型正文中自行输出字数统计，系统会统一校验。
+3. 不在模型正文中自行输出字数统计、偏差说明、自评结果或任何生成过程说明。
 
 ## 七、单章质量自检评分
 评分机制只用于“当前单章内容质量自检”，不用于判断全书引用完整性，也不要求普通章输出参考文献。
@@ -80,7 +82,8 @@ BLOCK_PREFIXES = (
 )
 FORBIDDEN_PATTERNS = (
     "我们", "笔者", "值得注意的是", "令人惊讶的是", "显然", "<html", "<script", "<iframe",
-    "[待补充]", "TODO", "此处省略", "详见", "根据最新检索结果", "请搜索", "请查询"
+    "[待补充]", "TODO", "此处省略", "详见", "根据最新检索结果", "请搜索", "请查询",
+    "制定", "作出", "提升"
 )
 REFERENCE_LINE_RE = re.compile(r"^\s*\[\d+\]\s*.+(?:\[M\]|\[J\]|\[S\]|\[R\]|\[EB/OL\]|\[D\]).+", re.IGNORECASE)
 
@@ -142,13 +145,28 @@ def _extract_reference_lines(text: str) -> List[str]:
     return lines
 
 
+def _has_chinese_academic_numbering(text: str) -> bool:
+    """识别中文专著正文中的章节/层级编号，不强制要求保留“第X章”章标题。"""
+    if not text:
+        return False
+    return bool(
+        re.search(r"第\s*(?:[1-9]\d*|[一二三四五六七八九十百千万零〇两]+)\s*章", text)
+        or re.search(r"第\s*(?:[1-9]\d*|[一二三四五六七八九十百千万零〇两]+)\s*节", text)
+        or re.search(r"(?m)^\s*#{1,6}\s*第\s*(?:[1-9]\d*|[一二三四五六七八九十百千万零〇两]+)\s*节", text)
+        or re.search(r"(?m)^\s*#{1,6}\s*[一二三四五六七八九十百千万零〇两]+、\S+", text)
+        or re.search(r"(?m)^\s*[一二三四五六七八九十百千万零〇两]+、\S+", text)
+        or re.search(r"(?m)^\s*#{1,6}\s*（[一二三四五六七八九十百千万零〇两]+）\S+", text)
+        or re.search(r"(?m)^\s*（[一二三四五六七八九十百千万零〇两]+）\S+", text)
+    )
+
+
 def self_assess_chapter(content: str, target_words: int = 0) -> Tuple[Dict[str, int], int, str]:
     text = content or ""
     scores: Dict[str, int] = {}
 
-    has_invalid_number = bool(re.search(r"第\s*0\s*章|Section\s*1\s*:", text, re.IGNORECASE))
-    has_chapter = bool(re.search(r"第\s*[1-9]\d*\s*章", text))
-    scores["编号连续性与一致性"] = 10 if has_chapter and not has_invalid_number else 5 if has_chapter else 0
+    has_invalid_number = bool(re.search(r"第\s*0\s*章|第\s*0\s*节|Section\s*1\s*:", text, re.IGNORECASE))
+    has_numbering = _has_chinese_academic_numbering(text)
+    scores["编号连续性与一致性"] = 10 if has_numbering and not has_invalid_number else 5 if has_numbering else 0
 
     actual = count_manuscript_words(strip_self_assessment(text))
     scores["字数偏差"], deviation_note = _score_word_deviation(actual, target_words)

@@ -1,0 +1,27 @@
+{
+  "taskId": "019e1a93-05b0-74b4-8be7-ea651b390029",
+  "todos": [
+    {
+      "id": "7d81a1fa680706c0edd21e10be7be026",
+      "content": "检查项目启动方式与依赖清单",
+      "status": "completed"
+    },
+    {
+      "id": "d22a5e44d1765849e94fe1a0d320aeab",
+      "content": "安装项目依赖（Python 3.8 下跳过不兼容的 unstructured>=0.15/langgraph，Web 启动核心依赖已安装并通过导入验证）",
+      "status": "completed"
+    },
+    {
+      "id": "433a545018a9a07c06265cec2e59505e",
+      "content": "启动本地 Streamlit 服务",
+      "status": "completed"
+    },
+    {
+      "id": "8f4f85c1c493f22111e662769d806cde",
+      "content": "确认服务启动结果",
+      "status": "completed"
+    }
+  ],
+  "lastUpdated": 1778575853816,
+  "status": "active"
+}

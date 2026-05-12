@@ -3,6 +3,7 @@ import openai
 from openai import OpenAI  # For OpenAI
 import logging
 import json
+import re
 from tenacity import retry, stop_after_attempt, wait_random_exponential
 from libriscribe.settings import Settings
 
@@ -137,10 +138,46 @@ class LLMClient:
         except Exception:
             return str(response)[:limit]
 
+    @staticmethod
+    def _strip_role_marker_noise(text: str) -> str:
+        """剥离 OpenAI-compatible 中转误返回/泄露的 chat role 标记。"""
+        value = str(text or "").strip()
+        if not value:
+            return ""
+        value = re.sub(r"(?im)^\s*(?:assistant\s*){1,8}[:：\-—\s]*", "", value)
+        value = re.sub(r"(?im)^\s*(?:user|system|tool|developer)\s*[:：\-—]\s*", "", value)
+        value = re.sub(r"(?i)(?<=\n)(?:assistant\s*){2,}(?=\S)", "", value)
+        value = re.sub(r"(?i)^(?:assistant\s*){2,}(?=\S)", "", value)
+        return value.strip()
+
+    @classmethod
+    def _is_role_marker_only(cls, text: str) -> bool:
+        """判断响应是否只有 assistant/user/system 等角色名，没有真正正文。"""
+        raw = str(text or "").strip()
+        if not raw:
+            return True
+        compact = re.sub(r"[\s:：\-—_`'\"，。,.!！?？\[\]()（）{}<>]+", "", raw, flags=re.IGNORECASE).lower()
+        if compact in {"assistant", "assistantassistant", "user", "system", "tool", "developer"}:
+            return True
+        return not cls._strip_role_marker_noise(raw)
+
+    def _valid_generated_text_or_empty(self, text: str, *, source: str = "模型") -> str:
+        """返回有效正文；若只得到角色标记，记录清晰诊断并返回空。"""
+        value = str(text or "").strip()
+        self.last_response_preview = value[:2000]
+        if self._is_role_marker_only(value):
+            self.last_error = (
+                f"{source}只返回了 chat 角色标记“{value[:80] or '空'}”，没有正文。"
+                "这通常表示 API Base、模型名称或 OpenAI-compatible 协议不匹配，"
+                "也可能是中转站把流式 role 字段误当作 content 返回。"
+            )
+            return ""
+        return value
+
     def _stringify_content_blocks(self, content) -> str:
         """兼容 OpenAI-compatible 平台常见的 content 分块格式。"""
         text = self._deep_find_text(content, prefer_text_keys=True)
-        return text.strip()
+        return self._strip_role_marker_noise(text)
 
     def _deep_find_text(self, value, prefer_text_keys: bool = False, _depth: int = 0) -> str:
         """递归提取不同 OpenAI-like 响应结构中的正文。"""
@@ -190,7 +227,16 @@ class LLMClient:
         """兼容标准与第三方 OpenAI-like 返回格式，包含 choices.text / responses.output。"""
         text = self._deep_find_text(response)
         if text and not text.startswith(("ChatCompletion(", "Response(")):
-            return text.strip()
+            raw_text = str(text).strip()
+            if self._is_role_marker_only(raw_text):
+                self.last_response_preview = raw_text[:2000]
+                self.last_error = (
+                    f"模型只返回了 chat 角色标记“{raw_text[:80] or '空'}”，没有正文。"
+                    "请检查 API Base 是否应以 /v1 结尾、模型名称是否真实可用，"
+                    "以及该中转是否完整兼容 /chat/completions 的 message.content。"
+                )
+                return ""
+            return self._strip_role_marker_noise(raw_text)
         return ""
 
     def stream_content(self, prompt: str, max_tokens: int = 2000, temperature: float = 0.7, language: str = "English"):
@@ -249,7 +295,15 @@ class LLMClient:
             yield content
 
     @retry(wait=wait_random_exponential(min=1, max=60), stop=stop_after_attempt(6))
-    def generate_content(self, prompt: str, max_tokens: int = 2000, temperature: float = 0.7, language: str = "English") -> str:
+    def generate_content(
+        self,
+        prompt: str,
+        max_tokens: int = 2000,
+        temperature: float = 0.7,
+        language: str = "English",
+        timeout_seconds: int | None = None,
+        raw_attempt_limit: int | None = None,
+    ) -> str:
         """
         Generates text using the selected LLM provider.
         Now supports specifying the output language explicitly.
@@ -302,7 +356,7 @@ class LLMClient:
                     "temperature": temperature
                 }
                 endpoint = (self.custom_api_base.rstrip("/") if self.custom_api_base else "https://api.deepseek.com/v1") + "/chat/completions"
-                response = requests.post(endpoint, headers=headers, json=data, timeout=120) # Timeout
+                response = requests.post(endpoint, headers=headers, json=data, timeout=timeout_seconds or 120) # Timeout
                 response.raise_for_status() # Raise for HTTP errors
                 return response.json()["choices"][0]["message"]["content"].strip()
             elif self.llm_provider == "mistral":
@@ -318,7 +372,7 @@ class LLMClient:
                 }
 
                 endpoint = (self.custom_api_base.rstrip("/") if self.custom_api_base else "https://api.mistral.ai/v1") + "/chat/completions"
-                response = requests.post(endpoint, headers=headers, json=data, timeout=120)
+                response = requests.post(endpoint, headers=headers, json=data, timeout=timeout_seconds or 120)
                 response.raise_for_status()
                 return response.json()['choices'][0]['message']['content'].strip()
 
@@ -371,11 +425,13 @@ class LLMClient:
                     {"temperature": temperature},
                     {},
                 ]
+                if raw_attempt_limit is not None:
+                    raw_attempts = raw_attempts[:max(1, int(raw_attempt_limit))]
                 for params in raw_attempts:
                     try:
                         self.last_error = ""
                         payload = {"model": self.model, "messages": messages, **params}
-                        raw_response = requests.post(raw_endpoint, headers=raw_headers, json=payload, timeout=180)
+                        raw_response = requests.post(raw_endpoint, headers=raw_headers, json=payload, timeout=timeout_seconds or 180)
                         raw_preview = raw_response.text[:2000]
                         self.last_response_preview = raw_preview
                         raw_response.raise_for_status()
@@ -385,10 +441,14 @@ class LLMClient:
                             raw_payload = raw_response.text
                         text = self._extract_openai_compatible_text(raw_payload)
                         self.last_response_preview = (text or self._safe_response_preview(raw_payload))[:2000]
-                        if text:
+                        valid_text = self._valid_generated_text_or_empty(text, source="自定义 OpenAI-compatible 接口") if text else ""
+                        if valid_text:
                             self.last_error = ""
-                            return text
-                        last_exc = ValueError(f"requests chat 返回成功但未提取到正文；响应预览：{self.last_response_preview[:500]}")
+                            return valid_text
+                        if self.last_error:
+                            last_exc = ValueError(self.last_error)
+                        else:
+                            last_exc = ValueError(f"requests chat 返回成功但未提取到正文；响应预览：{self.last_response_preview[:500]}")
                     except Exception as exc:
                         last_exc = exc
                         self.last_error = str(exc)
@@ -406,9 +466,13 @@ class LLMClient:
                             )
                             text = self._extract_openai_compatible_text(response)
                             self.last_response_preview = (text or self._safe_response_preview(response))[:2000]
-                            if text:
-                                return text
-                            last_exc = ValueError(f"responses 返回成功但未提取到正文；响应预览：{self.last_response_preview[:500]}")
+                            valid_text = self._valid_generated_text_or_empty(text, source="自定义 OpenAI-compatible responses 接口") if text else ""
+                            if valid_text:
+                                return valid_text
+                            if self.last_error:
+                                last_exc = ValueError(self.last_error)
+                            else:
+                                last_exc = ValueError(f"responses 返回成功但未提取到正文；响应预览：{self.last_response_preview[:500]}")
                         except Exception as exc:
                             last_exc = exc
                             self.last_error = str(exc)

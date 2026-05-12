@@ -23,6 +23,8 @@ from libriscribe.export.pptx_export import PptxExporter
 from libriscribe.knowledge_base import Chapter, ChapterSection, Citation, EvidenceChunk, ProjectKnowledgeBase, SourceDocument
 from libriscribe.services.global_settings_service import GlobalSettingsService
 from libriscribe.services.prompt_service import PromptService, PROMPT_ANALYSIS_GUIDE
+from libriscribe.services.quality_service import QualityService
+from libriscribe.utils.academic_prompt import self_assess_chapter
 
 
 EXPECTED_NAV_PAGES = [
@@ -173,7 +175,7 @@ def test_parse_outline_supports_chinese_section_hierarchy() -> None:
 
 
 def test_parse_outline_distributes_parent_words_to_leaf_children() -> None:
-    """父级节有字数、叶子小节未标字数时，应把父级字数平均分配给所有叶子小节。"""
+    """父级节有字数、叶子小节未标字数时，应按标题语义权重非均匀分配，并保持总量守恒。"""
     project = app.ProjectKnowledgeBase(project_name="leaf_words", title="阅读行为研究")
     outline = """第一章 高职学生阅读行为研究（总字数 10000字）
 第一节 高职学生的阅读行为画像（约5150字）
@@ -189,10 +191,44 @@ def test_parse_outline_distributes_parent_words_to_leaf_children() -> None:
     assert created == 1
     level2_sections = [sec for sec in project.chapters[1].sections if sec.section_number.count(".") == 2]
     leaf_sections = [sec for sec in project.chapters[1].sections if sec.section_number.count(".") == 3]
-    assert [sec.word_count for sec in level2_sections] == [2575, 2575]
-    assert [sec.word_count for sec in leaf_sections] == [1288, 1287, 1288, 1287]
-    assert sum(sec.word_count for sec in level2_sections) == 5150
-    assert sum(sec.word_count for sec in leaf_sections) == 5150
+    level2_words = [sec.word_count for sec in level2_sections]
+    leaf_words = [sec.word_count for sec in leaf_sections]
+    assert sum(level2_words) == 5150
+    assert sum(leaf_words) == 5150
+    assert len(set(level2_words)) > 1
+    assert len(set(leaf_words)) > 1
+    assert level2_words[1] > level2_words[0]
+    assert leaf_words[-1] > leaf_words[0]
+
+
+def test_semantic_word_targets_preserve_total_and_prefer_complex_topics() -> None:
+    """非均匀语义权重应把更多字数分给治理、模型、风险等复杂议题。"""
+    targets = app._semantic_word_targets(
+        ["基本概念界定", "数据治理机制与风险控制模型", "应用场景"],
+        3000,
+    )
+
+    assert sum(targets) == 3000
+    assert targets[1] > targets[0]
+    assert targets[1] > targets[2]
+    assert targets[1] - targets[0] >= 450
+
+
+def test_semantic_word_targets_amplify_write_thought_complexity() -> None:
+    """标题相近时，写作思路里的机制、证据、路径信息也应拉开字数差距。"""
+    targets = app._semantic_word_targets(
+        [
+            "概念边界 写作思路：界定基本内涵。",
+            "治理机制 写作思路：结合数据治理、风险控制、实施路径与评价模型展开。",
+            "应用场景 写作思路：说明普通场景。",
+            "小结 写作思路：承接下文。",
+        ],
+        4000,
+    )
+
+    assert sum(targets) == 4000
+    assert targets[1] == max(targets)
+    assert targets[1] - targets[3] >= 500
 
 
 def test_editor_outline_section_label_uses_chinese_hierarchy() -> None:
@@ -357,11 +393,34 @@ def test_chapter_writer_quality_rewrite_prompt_forbids_unsupported_facts() -> No
     assert "没有资料依据时不得写成确定性事实" in prompt
     assert "【信息缺失】" in prompt
     assert "资料来源：" in prompt
+    assert "必须继续遵守原始提示词" in prompt
+    assert "证据绑定规则（专著强制）" in prompt
+    assert "正文输出边界（强制）" in prompt
+    assert "去 AI 痕迹与出版级表达" in prompt
+    assert "不得因为重写而放松原有限定" in prompt
+
+
+def test_quality_service_section_report_structures_hard_failures() -> None:
+    """小节级质量报告应给出硬伤、软警告和可返回给 AI 的修订指令。"""
+    report = QualityService.section_quality_report(
+        "（一） 政策牵引",
+        "已有研究表明智慧工地在2024年增长达到35%[3]。我们认为这是革命性的变化。评分：80。",
+        target_words=800,
+        citations=[],
+    )
+
+    assert report["passed"] is False
+    assert report["quality_score"] < 78
+    assert report["hard_failures"]
+    assert any("伪引用" in item or "无绑定引用" in item for item in report["hard_failures"])
+    assert any("无来源事实句" in item for item in report["hard_failures"])
+    assert report["revision_instructions"]
+    assert "pseudo_citation_hits" in report["metrics"]
 
 
 
 def test_chapter_writer_quality_gate_rewrites_risky_section(monkeypatch) -> None:
-    """小节生成后发现伪引用/无来源事实句/语体风险时，应在写入前定向重写一次。"""
+    """小节生成后发现伪引用/无来源事实句/语体风险时，应在写入前定向重写并保留最佳版本。"""
 
     class RewriteLLM:
         llm_provider = "custom"
@@ -371,7 +430,9 @@ def test_chapter_writer_quality_gate_rewrites_risky_section(monkeypatch) -> None
 
         def generate_content(self, prompt: str, max_tokens: int = 2000, temperature: float = 0.7) -> str:
             self.calls.append(prompt)
-            return "　　本节围绕智慧工地建设的概念边界、运行机制、实施路径和风险治理展开分析，强调工程现场数字化管理需要在组织体系、数据治理、技术集成和价值评估之间形成稳定协同。"
+            if len(self.calls) == 1:
+                return "　　本节围绕智慧工地建设的概念边界、运行机制、实施路径和风险治理展开分析，强调工程现场数字化管理需要在组织体系、数据治理、技术集成和价值评估之间形成稳定协同。"
+            return "　　已有研究表明智慧工地建设在2024年增长达到35%[9]。"
 
     project = ProjectKnowledgeBase(project_name="quality_gate", title="智慧工地建设与工程现场数字化管理")
     chapter = Chapter(
@@ -391,12 +452,46 @@ def test_chapter_writer_quality_gate_rewrites_risky_section(monkeypatch) -> None
 
     content = writer._write_academic_chapter(project, 1, chapter)
 
-    assert len(llm.calls) == 1
+    assert len(llm.calls) == 2
     assert "质量门禁发现的问题" in llm.calls[0]
     assert "定向重写要求" in llm.calls[0]
+    assert "必须继续遵守原始提示词" in llm.calls[0]
     assert "已有研究表明" not in content
     assert "[3]" not in content
     assert "运行机制" in content
+
+
+def test_chapter_writer_quality_gate_keeps_best_version_when_later_rewrite_regresses(monkeypatch) -> None:
+    """多轮质量闭环不能盲目采用最后一次输出，后续退化时应保留当前最佳版本。"""
+
+    class TwoRoundLLM:
+        llm_provider = "custom"
+
+        def __init__(self) -> None:
+            self.calls = []
+
+        def generate_content(self, prompt: str, max_tokens: int = 2000, temperature: float = 0.7) -> str:
+            self.calls.append(prompt)
+            if len(self.calls) == 1:
+                return "　　本节从概念边界、治理机制和风险控制三个层面展开，说明工程现场数字化管理需要把组织流程、数据治理、技术集成、实施路径和价值评价放在同一运行框架中理解。由于资料库尚未提供可核验统计数据，涉及规模、比例和政策编号的判断均应保持审慎，并以现场管理逻辑和证据边界为基础。"
+            return "　　已有研究表明智慧工地建设在2024年增长达到35%[9]。"
+
+    project = ProjectKnowledgeBase(project_name="quality_best", title="智慧工地建设与工程现场数字化管理")
+    llm = TwoRoundLLM()
+    writer = ChapterWriterAgent(llm_client=llm)
+
+    content = writer._quality_gate_section_content(
+        project=project,
+        prompt="原始提示含证据绑定规则（专著强制）、正文输出边界（强制）、去 AI 痕迹与出版级表达。",
+        section_title="（一） 风险治理",
+        content="　　已有研究表明智慧工地建设在2024年增长达到35%[3]。我们认为这是革命性的变化。",
+        target_words=800,
+    )
+
+    assert len(llm.calls) >= 1
+    assert "运行框架" in content
+    assert "[9]" not in content
+    assert "革命性" not in content
 
 
 def test_chapter_writer_keeps_overlong_sections_without_forced_compression(monkeypatch) -> None:
@@ -653,6 +748,103 @@ def test_custom_llm_client_fallbacks_do_not_downshift_to_tiny_output_budgets() -
     assert 1200 not in max_token_values
 
 
+def test_custom_llm_client_accepts_fast_fail_options_for_reference_generation() -> None:
+    """参考文献生成可限制 raw HTTP 尝试次数和请求超时，不影响默认章节长文预算。"""
+    from libriscribe.utils.llm_client import LLMClient
+
+    client = object.__new__(LLMClient)
+    client.llm_provider = "custom"
+    client.custom_api_base = "https://example.test/v1"
+    client.custom_api_key = "key"
+    client.model = "model"
+    client.client = types.SimpleNamespace(responses=None)
+    client.last_error = ""
+    client.last_response_preview = ""
+    calls = []
+
+    class FakeResponse:
+        text = "{}"
+
+        def raise_for_status(self) -> None:
+            raise RuntimeError("stop after raw attempt")
+
+    def fake_post(url, headers, json, timeout):
+        calls.append({"payload": json, "timeout": timeout})
+        return FakeResponse()
+
+    import requests
+    original_post = requests.post
+    try:
+        requests.post = fake_post
+        client.generate_content("提示", max_tokens=2800, temperature=0.2, timeout_seconds=45, raw_attempt_limit=2)
+    finally:
+        requests.post = original_post
+
+    assert len(calls) == 2
+    assert [call["timeout"] for call in calls] == [45, 45]
+    assert [call["payload"].get("max_tokens") for call in calls] == [2800, 2800]
+
+
+def test_custom_llm_client_rejects_role_marker_only_response() -> None:
+    """自定义 OpenAI-compatible 只返回 assistant 角色标记时，应视为无效响应并给出配置诊断。"""
+    from libriscribe.utils.llm_client import LLMClient
+
+    client = object.__new__(LLMClient)
+    client.llm_provider = "custom"
+    client.custom_api_base = "https://example.test/v1"
+    client.custom_api_key = "key"
+    client.model = "model"
+    client.client = types.SimpleNamespace(responses=None)
+    client.last_error = ""
+    client.last_response_preview = ""
+
+    class FakeResponse:
+        text = '{"choices":[{"message":{"role":"assistant","content":"assistant"}}]}'
+
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self):
+            return {"choices": [{"message": {"role": "assistant", "content": "assistant"}}]}
+
+    def fake_post(url, headers, json, timeout):
+        return FakeResponse()
+
+    import requests
+    original_post = requests.post
+    try:
+        requests.post = fake_post
+        result = client.generate_content("你好，请简短回复一句话。", max_tokens=80, temperature=0.0, raw_attempt_limit=1)
+    finally:
+        requests.post = original_post
+
+    assert result == ""
+    assert "角色标记" in client.last_error
+    assert "API Base" in client.last_error
+
+
+def test_profile_connection_rejects_role_marker_only_response(monkeypatch) -> None:
+    """在线检测不能把 assistant 角色空响应误判为模型可用。"""
+
+    class FakeClient:
+        last_error = "模型只返回了 chat 角色标记“assistant”，没有正文。"
+        last_response_preview = "assistant"
+
+        def generate_content(self, prompt: str, max_tokens: int = 80, temperature: float = 0.0) -> str:
+            return "assistant"
+
+    monkeypatch.setattr(app, "_create_llm_client_from_profile", lambda profile: FakeClient())
+
+    ok, msg = app._profile_connection_result(
+        {"provider": "custom", "api_key": "key", "model": "gpt-5.5", "api_base": "https://example.test/v1"},
+        "你好，请简短回复一句话。",
+    )
+
+    assert ok is False
+    assert "角色标记" in msg
+    assert "不能判定为在线可用" in msg
+
+
 def test_chapter_writer_enforces_max_three_balanced_paragraphs() -> None:
     """无论模型输出多少碎段，最终每小节最多 3 段，且可切分时每段不少于 5 句。"""
     writer = ChapterWriterAgent(llm_client=object())
@@ -665,6 +857,22 @@ def test_chapter_writer_enforces_max_three_balanced_paragraphs() -> None:
     assert all(p.startswith("　　") for p in paragraphs)
     assert all("\n" not in p for p in paragraphs)
     assert all(len(re.findall(r"[。！？.!?]", p)) >= 5 for p in paragraphs)
+
+
+
+def test_chapter_writer_sanitizes_leaked_chat_role_prefixes() -> None:
+    """正文生成清理应剥离中转接口泄露的 assistant/user/system 角色前缀。"""
+    writer = ChapterWriterAgent(llm_client=object())
+
+    cleaned = writer._sanitize_model_output(
+        "assistantassistant 　　本节围绕服务咨询展开。\nassistant: 第二段继续分析。\nsystem: 调试信息",
+        "（一） 服务类咨询",
+    )
+
+    assert "assistant" not in cleaned.lower()
+    assert "system:" not in cleaned.lower()
+    assert "本节围绕服务咨询展开" in cleaned
+    assert "第二段继续分析" in cleaned
 
 
 
@@ -956,6 +1164,31 @@ def test_manuscript_part_prompts_use_user_requirements_and_specialized_templates
     assert "不得在文献末尾附加 DOI、URL、OpenAlex、网页链接或 `https://` 链接" in references_prompt
 
 
+def test_reference_generation_uses_fast_fail_model_call() -> None:
+    """参考文献生成必须使用更短超时与更少 raw HTTP 尝试，避免网页一直转圈。"""
+    source = inspect.getsource(app._generate_manuscript_part_with_ai)
+
+    assert 'part_key == "references"' in source
+    assert '"max_tokens": 2800' in source
+    assert '"timeout_seconds": 45' in source
+    assert '"raw_attempt_limit": 2' in source
+
+
+def test_friendly_llm_generation_error_explains_common_api_failures() -> None:
+    """常见模型接口错误应转换成用户可处理的中文提示。"""
+    client = types.SimpleNamespace(last_error="422 model not found: gpt-5.5", last_response_preview="")
+    message = app._friendly_llm_generation_error("参考文献", RuntimeError("failed"), client)
+
+    assert "生成参考文献失败" in message
+    assert "模型名称不可用" in message
+    assert "模型设置" in message
+
+    client.last_error = "524 Gateway Timeout"
+    message = app._friendly_llm_generation_error("参考文献", RuntimeError("timeout"), client)
+    assert "模型接口超时" in message
+    assert "避免页面一直转圈" in message
+
+
 def test_manuscript_part_generation_options_read_latest_session_state(monkeypatch) -> None:
     """网页修改前言/结语字数后，AI 生成必须读取当前控件值，而不是默认 1500/1600。"""
     monkeypatch.setattr(
@@ -982,6 +1215,34 @@ def test_manuscript_part_truncation_hard_caps_overlong_model_output() -> None:
 
     assert app._count_manuscript_words(truncated) <= 972
     assert truncated.endswith(("。", "！", "？", ".", "!", "?"))
+
+
+def test_self_assess_chapter_accepts_body_level_chinese_numbering_without_chapter_heading() -> None:
+    """章节正文只保留节/三级/四级标题时，编号连续性不应被误判为 0 分。"""
+    content = """
+## 第一节 阅读推广服务的现实基础
+
+### 一、服务对象与场景边界
+
+#### （一）馆藏资源与活动空间
+
+高职图书馆阅读推广需要围绕专业学习、技能训练与职业发展组织服务内容，并在资料来源可核验的前提下展开分析。
+"""
+
+    scores, total, verdict = self_assess_chapter(content, target_words=0)
+
+    assert scores["编号连续性与一致性"] == 10
+    assert total >= 40
+    assert "编号连续性与一致性" not in verdict
+
+
+def test_sidebar_does_not_expose_one_click_outline_generation() -> None:
+    """侧边栏只保留页面导航，不再提供会绕过大纲页的一键 AI 生成大纲按钮。"""
+    sidebar_source = inspect.getsource(app.render_sidebar)
+
+    assert "sidebar_ai_generate_outline" not in sidebar_source
+    assert "下一步：生成/整理大纲" not in sidebar_source
+    assert "_generate_outline_with_ai(project)" not in sidebar_source
 
 
 def test_sidebar_exposes_formatted_word_export_and_structured_adapter(tmp_path) -> None:
