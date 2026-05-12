@@ -1,0 +1,3 @@
+[console_scripts]
+libriscribe = libriscribe.main:app
+libriscribe-web = libriscribe.web.app:main

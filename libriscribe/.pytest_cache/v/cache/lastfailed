@@ -1,0 +1,3 @@
+{
+  "tests/test_commercial_routes.py::test_chapter_writer_compresses_overlong_sections_before_finalize": true
+}
