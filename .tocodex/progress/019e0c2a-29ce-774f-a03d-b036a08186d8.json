@@ -1,0 +1,77 @@
+{
+  "taskId": "019e0c2a-29ce-774f-a03d-b036a08186d8",
+  "todos": [
+    {
+      "id": "bc36313f5a19dc291ba0847003721ca3",
+      "content": "修复 SourceDocument 导入错误并确认 knowledge_base 运行时导出",
+      "status": "completed"
+    },
+    {
+      "id": "e41982a911b1ac378c2e01fb205b15c3",
+      "content": "运行模块级 import 检测和 Streamlit app import 检测",
+      "status": "completed"
+    },
+    {
+      "id": "b04195e9fcb0827bb0f82deb1c62a839",
+      "content": "检查是否存在重复包路径或旧进程缓存导致的导入混淆",
+      "status": "completed"
+    },
+    {
+      "id": "82a16ec78f7a9422e072aef10b4649d7",
+      "content": "写入报错修复备忘录",
+      "status": "completed"
+    },
+    {
+      "id": "f6de89871cdbb4115b839ca58b59cfdf",
+      "content": "修复 RAG 索引时 chromadb 缺失导致不可用",
+      "status": "completed"
+    },
+    {
+      "id": "5910f5ebd7d186688f68fe169949760c",
+      "content": "验证 chromadb/vector_store/资料索引导入链路",
+      "status": "completed"
+    },
+    {
+      "id": "dc11ea88a0fc12a9052de45c4ddff87e",
+      "content": "必要时重启 Streamlit 并写入本次修复备忘录",
+      "status": "completed"
+    },
+    {
+      "id": "5d798b288ee38a8495585a9256fc4fe7",
+      "content": "修复 DOC/OLE 二进制误当文本索引导致证据片段乱码的首轮加载器防护",
+      "status": "completed"
+    },
+    {
+      "id": "a922e0dee5e2f186593472e712a7bece",
+      "content": "清理残留乱码：项目 JSON、Streamlit 会话可见数据与 ChromaDB 向量库",
+      "status": "completed"
+    },
+    {
+      "id": "ad3bc8c37219dceca4aedbabccda6b25",
+      "content": "增加资料库页面展示前的乱码证据防御过滤与自动落盘清理",
+      "status": "completed"
+    },
+    {
+      "id": "ba42569a20c9e19d002410cc0cb2f568",
+      "content": "验证 document_id 1185a4ca8f75cfc8 不再出现在项目与向量库",
+      "status": "completed"
+    },
+    {
+      "id": "79e0688360098c6f93f3f8b715232b2f",
+      "content": "重启 Streamlit 使会话状态重新加载",
+      "status": "completed"
+    },
+    {
+      "id": "57174d2112992961b74b7584a5667ef2",
+      "content": "更新 DOC/OLE 乱码修复备忘录",
+      "status": "completed"
+    },
+    {
+      "id": "d13dc5b2550571a3c0f4413192349ba5",
+      "content": "暂停并待恢复：引用核验中心最小实现",
+      "status": "pending"
+    }
+  ],
+  "lastUpdated": 1778373985123,
+  "status": "active"
+}
