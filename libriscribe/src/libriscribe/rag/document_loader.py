@@ -4,12 +4,12 @@
 支持 PDF/Word/Excel/TXT/Markdown 文件的解析和分块。
 """
 
+import base64
 import json
 import logging
 import hashlib
 import os
 import re
-import time
 from pathlib import Path
 from typing import List, Dict, Any, Optional
 from dataclasses import dataclass, field
@@ -177,10 +177,11 @@ class DocumentLoader:
         return ""
 
     def _load_pdf_with_paddleocr(self, file_path: str) -> str:
-        """使用 PaddleOCR AIStudio 在线接口识别 PDF 文字，返回纯文本。
+        """使用 PaddleOCR AIStudio layout-parsing 接口识别 PDF 文字，返回 Markdown/纯文本。
 
         配置方式：设置环境变量 PADDLEOCR_AISTUDIO_TOKEN；可选设置
-        PADDLEOCR_AISTUDIO_MODEL、PADDLEOCR_AISTUDIO_JOB_URL、PADDLEOCR_AISTUDIO_TIMEOUT_SECONDS。
+        PADDLEOCR_AISTUDIO_LAYOUT_URL、PADDLEOCR_AISTUDIO_TIMEOUT_SECONDS。
+        AIStudio 官方示例要求使用 JSON + base64 文件内容，并以 ``Authorization: token ...`` 鉴权。
         """
         token = os.getenv("PADDLEOCR_AISTUDIO_TOKEN", "").strip()
         if not token:
@@ -193,57 +194,55 @@ class DocumentLoader:
             logger.warning("PaddleOCR fallback skipped: requests is not installed")
             return ""
 
-        job_url = os.getenv("PADDLEOCR_AISTUDIO_JOB_URL", "https://paddleocr.aistudio-app.com/api/v2/ocr/jobs").strip()
-        model = os.getenv("PADDLEOCR_AISTUDIO_MODEL", "PP-OCRv5").strip() or "PP-OCRv5"
-        timeout_seconds = self._safe_int(os.getenv("PADDLEOCR_AISTUDIO_TIMEOUT_SECONDS"), 180)
-        optional_payload = {
-            "useDocOrientationClassify": False,
-            "useDocUnwarping": False,
-            "useTextlineOrientation": False,
+        api_url = (
+            os.getenv("PADDLEOCR_AISTUDIO_LAYOUT_URL", "")
+            or os.getenv("PADDLEOCR_AISTUDIO_JOB_URL", "")
+            or "https://c3q5maa8cfq9rex9.aistudio-app.com/layout-parsing"
+        ).strip()
+        timeout_seconds = max(30, self._safe_int(os.getenv("PADDLEOCR_AISTUDIO_TIMEOUT_SECONDS"), 180))
+        headers = {
+            "Authorization": f"token {token}",
+            "Content-Type": "application/json",
         }
-        headers = {"Authorization": f"bearer {token}"}
 
         try:
             with open(file_path, "rb") as f:
-                response = requests.post(
-                    job_url,
-                    headers=headers,
-                    data={"model": model, "optionalPayload": json.dumps(optional_payload)},
-                    files={"file": f},
-                    timeout=60,
-                )
+                file_data = base64.b64encode(f.read()).decode("ascii")
+
+            response = requests.post(
+                api_url,
+                json={
+                    "file": file_data,
+                    "fileType": 0,
+                    "useDocOrientationClassify": False,
+                    "useDocUnwarping": False,
+                    "useChartRecognition": False,
+                },
+                headers=headers,
+                timeout=timeout_seconds,
+            )
             if response.status_code != 200:
-                logger.warning("PaddleOCR job submit failed for %s: %s %s", file_path, response.status_code, response.text[:500])
-                return ""
-            job_id = (response.json().get("data") or {}).get("jobId", "")
-            if not job_id:
-                logger.warning("PaddleOCR job submit returned no jobId for %s: %s", file_path, response.text[:500])
+                logger.warning("PaddleOCR layout parsing failed for %s: %s %s", file_path, response.status_code, response.text[:500])
                 return ""
 
-            deadline = time.time() + max(30, timeout_seconds)
-            jsonl_url = ""
-            while time.time() < deadline:
-                result_response = requests.get(f"{job_url}/{job_id}", headers=headers, timeout=30)
-                if result_response.status_code != 200:
-                    logger.warning("PaddleOCR polling failed for %s: %s %s", file_path, result_response.status_code, result_response.text[:500])
-                    return ""
-                payload = result_response.json().get("data") or {}
-                state = payload.get("state", "")
-                if state == "done":
-                    jsonl_url = ((payload.get("resultUrl") or {}).get("jsonUrl") or "").strip()
-                    break
-                if state == "failed":
-                    logger.warning("PaddleOCR job failed for %s: %s", file_path, payload.get("errorMsg", "unknown error"))
-                    return ""
-                time.sleep(5)
+            payload = response.json()
+            result = payload.get("result") or {}
+            pages: list[str] = []
+            for item in result.get("layoutParsingResults") or []:
+                markdown = item.get("markdown") or {}
+                page_text = str(markdown.get("text") or "").strip()
+                if page_text:
+                    pages.append(page_text)
 
-            if not jsonl_url:
-                logger.warning("PaddleOCR job timed out for %s", file_path)
-                return ""
+            if pages:
+                return "\n\n".join(self._dedupe_text_lines(pages))
 
-            jsonl_response = requests.get(jsonl_url, timeout=60)
-            jsonl_response.raise_for_status()
-            return self._extract_paddleocr_jsonl_text(jsonl_response.text)
+            fallback_text = self._collect_text_from_ocr_object(result)
+            if fallback_text.strip():
+                return fallback_text
+
+            logger.warning("PaddleOCR layout parsing returned no text for %s: %s", file_path, response.text[:500])
+            return ""
         except Exception as e:
             logger.warning("PaddleOCR fallback failed for %s: %s", file_path, e)
             return ""

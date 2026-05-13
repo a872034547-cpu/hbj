@@ -5321,59 +5321,26 @@ def _build_manuscript_part_prompt(
     ref_count = max(15, min(35, int(options.get('refCount') or 30)))
     citation_style = options.get('citationStyle') or 'GB/T 7714-2015'
     language_distribution = options.get('languageDistribution') or '以中文文献为主，可含少量权威英文文献'
-    return f"""你是一名学术参考文献整理与校验专家。
-你的唯一任务是为给生成的文章专著整理一批中文参考文献。
-你输出的内容必须是纯参考文献列表，不包含任何其他信息。
-
-【任务参数】
-- 专著名称：{book_title}
-- 所属学科/领域：{field}
-- 参考文献总数量：{ref_count} 条（控制在15-35条之间）
-- 文献语种分布：{language_distribution}（以中文文献为主；可含少量权威英文文献，但必须以中文为主）
-- 出版/发表时间范围：严格限制为 {ref_start_year} 年至 {ref_end_year} 年
-- 参考文献格式：{citation_style}
-
-【全书结构概览】
-{chapters}
-
-{common_context}
-
-【平台已有引用与资料上下文】
-{_manuscript_part_citation_context(project)}
-
-【文献类型构成要求】
-1. 必须以 M 类文献（专著、图书）为主体，占到总条目的 80% 以上。
-2. 可以辅以少量期刊论文（[J]）、学位论文（[D]）、会议论文（[C]）等，但期刊论文必须是能够在知网（cnki.net）公开检索到的。
-3. 禁止包含报纸文章（[N]）、一般网络文章（[EB/OL]）、标准（[S]）、专利（[P]）等非学术核心文献。
-
-【真实性硬性约束 - 不可违反】
-1. 你列出的每一条文献，都必须是真实存在的出版物。严禁编造、杜撰、拼凑任何文献。
-2. 对于 M 类文献（专著/图书）：
-   - 必须在条目中完整著录：作者、书名、出版地、出版社、出版年份。
-   - 出版社和出版年份必须是该专著实际对应的准确信息，不可随意匹配。
-   - 如果你对某本书的出版社或出版年份不确定，直接跳过，不列该条目。
-3. 对于期刊论文（[J]）：
-   - 必须能够在中国知网（cnki.net）通过篇名或作者检索到。
-   - 必须在条目中完整著录：作者、篇名、期刊名、年、卷、期、起止页码。
-   - 如果某篇论文你无法确认是否被知网收录，直接跳过。
-4. 对于其他类型文献（如论文集[C]、学位论文[D]），同样要求真实可查。
-
-【生成策略】
-- 你必须在内部进行“可验证性自检”：对每一篇拟输出的文献，确认自己有极高把握它是真实存在的，且出版信息准确。不确定的条目一律舍弃。
-- 为保证真实性，宁可少列几篇，也绝不用不确定的条目凑数。
-- 优先使用平台已有可核验引用记录、资料库来源和已导入的 OpenAlex/DOI/链接文献；但只有确认满足上述类型、年份、格式和真实性要求时才可列入。
-- 如果某个主题下真实存在的文献确实不足以达到请求数量，可以诚实减少输出条目，并在列表末尾用一行“（说明：经校验后确信存在的相关文献共计X条）”，但这一行说明之后不能再添加任何其他文字。
-
-【输出规则】
-1. 输出第一行是“参考文献”四个字（作为标题），空一行后逐条列出参考文献。
-2. 每条文献单独一行，按作者姓氏拼音排序，中文文献在前，英文文献在后。
-3. 正文结束后直接结束，不留任何额外字符、空行或表情符号。
-4. 绝对禁止在正文前后或中间输出以下内容：
-   - 字数统计、自评、评分
-   - 任何过程说明（如“以下是符合要求的文献”）
-   - 术语表、附录
-   - 分隔标记或装饰线
-"""
+    template = PromptService.load_global_prompt("manuscript_references")
+    values = {
+        "book_title": book_title,
+        "author": author,
+        "field": field,
+        "ref_count": ref_count,
+        "ref_start_year": ref_start_year,
+        "ref_end_year": ref_end_year,
+        "citation_style": citation_style,
+        "language_distribution": language_distribution,
+        "chapters": chapters,
+        "common_context": common_context,
+        "citation_context": _manuscript_part_citation_context(project),
+        "user_requirement": user_requirement,
+    }
+    try:
+        return template.format(**values)
+    except Exception as e:
+        logger.warning("Global manuscript reference prompt format failed; using built-in template: %s", e)
+        return PromptService.load_builtin_template("manuscript_references").format(**values)
 
 
 def _friendly_llm_generation_error(part_title: str, error: Exception, client: Optional[LLMClient] = None) -> str:
