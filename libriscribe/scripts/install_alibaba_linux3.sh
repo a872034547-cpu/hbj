@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-APP_DIR="${APP_DIR:-/opt/libriscribe}"
-APP_PORT="${APP_PORT:-8501}"
-REPO_URL="${REPO_URL:-https://github.com/guerra2fernando/libriscribe.git}"
+APP_DIR="${APP_DIR:-/home/admin/hbj/libriscribe}"
+APP_PORT="${APP_PORT:-8888}"
+REPO_URL="${REPO_URL:-https://github.com/a872034547-cpu/hbj.git}"
 PYTHON_BIN="${PYTHON_BIN:-python3}"
 PIP_INDEX_URL="${PIP_INDEX_URL:-https://pypi.tuna.tsinghua.edu.cn/simple}"
 

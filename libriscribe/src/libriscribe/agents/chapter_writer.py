@@ -259,10 +259,8 @@ class ChapterWriterAgent(Agent):
             if progress_callback:
                 progress_callback(generated_index, len(ordered_sections), section_title, "start")
 
-            target_min = max(1, int(target_words * 0.90))
-            target_max = max(target_min + 1, int(target_words * 1.10))
-            # 不再对已生成正文做强制裁剪；为避免“一写多”时因输出预算不足造成断尾，
-            # 这里给足生成预算，长度只通过提示词引导，不通过删除正文来收口。
+            # 初稿阶段不再把精确字数压力交给模型；这里只给足生成预算。
+            # 具体字数由后续系统统计、裁判和最多两轮补写/压缩修正完成。
             max_tokens = max(1800, min(16000, int(target_words * 3.0)))
             section_content = self._generate_section_with_retries(
                 prompt=prompt,
@@ -302,15 +300,6 @@ class ChapterWriterAgent(Agent):
                 generated_index=generated_index,
                 total_sections=len(ordered_sections),
             )
-            section_content = self._repair_word_count_loop(
-                content=section_content,
-                prompt=prompt,
-                section_title=section_title,
-                target_words=target_words,
-                content_callback=content_callback,
-                generated_index=generated_index,
-                total_sections=len(ordered_sections),
-            )
             section_content = self._quality_gate_section_content(
                 project=project_knowledge_base,
                 prompt=prompt,
@@ -337,7 +326,7 @@ class ChapterWriterAgent(Agent):
                 generated_index=generated_index,
                 total_sections=len(ordered_sections),
             )
-            section_content = self._repair_word_count_loop(
+            section_content = self._complete_truncated_tail(
                 content=section_content,
                 prompt=prompt,
                 section_title=section_title,
@@ -346,7 +335,7 @@ class ChapterWriterAgent(Agent):
                 generated_index=generated_index,
                 total_sections=len(ordered_sections),
             )
-            section_content = self._complete_truncated_tail(
+            section_content = self._repair_word_count_loop(
                 content=section_content,
                 prompt=prompt,
                 section_title=section_title,
@@ -423,7 +412,7 @@ class ChapterWriterAgent(Agent):
             f"目录层级：{section_level}\n"
             f"写作思路（最高优先级，只围绕它写，不自行扩展新分论点）：{section_goal}\n"
             f"本章强化提示词：{strength_rule}\n"
-            f"系统篇幅目标：约 {target_words} 字（仅供创作方向参考；不要在正文中统计、说明或自评字数）\n"
+            f"篇幅行为：正文应围绕写作思路充分展开，避免明显短促或重复灌水；具体字数由系统代码统计和修正，AI 不得自行计数、说明或自评字数。\n"
             f"段落行为：{paragraph_rule}"
         )
         values = {
@@ -872,20 +861,25 @@ class ChapterWriterAgent(Agent):
         total_sections: int = 1,
     ) -> str:
         """模型初稿明显超出目标字数时，先让模型保留论证骨架进行压缩。"""
-        if current_words <= max(1, int(target_words * 1.10)):
+        if current_words <= max(1, int(target_words * 1.05)):
             return content
+        delete_words = max(1, current_words - target_words)
         compress_prompt = f"""{prompt}
 
-## 已生成正文（明显超字数）
+## 已生成正文（系统统计后超出目标范围）
 {content}
 
+## 系统字数裁判结果
+目标约 {target_words} 字；系统统计当前约 {current_words} 字；需要删约 {delete_words} 字。
+
 ## 压缩任务
-当前正文约 {current_words} 字，需要删减约 {max(1, current_words - target_words)} 字。请在不新增事实、不新增引用、不输出标题的前提下精简冗余表述；不得截断半句话。
+请返回压缩后的完整正文，不要只返回删减说明。请在不新增事实、不新增引用、不输出标题的前提下精简冗余表述；不得截断半句话。
 要求：
 1. 保留核心概念、论证链条、实施路径、风险边界和已有可追溯来源。
 2. 删除重复铺陈、空泛过渡、规划说明和“写作思路/资料依据/证据边界/后续补充”等非正文内容。
 3. 少用双引号，普通判断句和概念直接陈述。
-4. 只输出压缩后的正文段落，每段以两个全角空格开头；可按论证自然转向分段，不要追求段落长度整齐。"""
+4. 只输出压缩后的完整正文段落，每段以两个全角空格开头；可按论证自然转向分段，不要追求段落长度整齐。
+5. 不要输出字数统计、偏差率、自评、评分、修改说明或过程说明。"""
         if content_callback:
             content_callback("_字数超出目标范围，正在压缩正文..._", section_title, generated_index, total_sections)
         try:
@@ -921,37 +915,44 @@ class ChapterWriterAgent(Agent):
         generated_index: int = 1,
         total_sections: int = 1,
     ) -> str:
-        """模型初稿明显短于大纲字数时，自动续写补足。"""
-        need_words = max(200, target_words - current_words)
+        """模型初稿明显短于大纲字数时，由系统发令要求补足并返回完整正文。"""
+        need_words = max(1, target_words - current_words)
         expand_prompt = f"""{prompt}
 
-## 已生成正文
+## 已生成正文（系统统计后低于目标范围）
 {base_content}
 
-## 续写任务
-当前正文约 {current_words} 字，需要补充约 {need_words} 字。
-请在不重复已有内容、不输出标题的前提下，扩展论证的概念边界、机制分析、适用场景或风险条件。
-只输出需要追加的正文段落；不要输出字数统计、自评或过程说明；少用双引号。"""
+## 系统字数裁判结果
+目标约 {target_words} 字；系统统计当前约 {current_words} 字；需要补约 {need_words} 字。
+
+## 补写任务
+请返回补写后的完整正文，不要只返回追加段落。请在不重复已有内容、不输出标题的前提下，扩展论证的概念边界、机制分析、适用场景或风险条件。
+要求：
+1. 保留原文核心内容和事实边界，不编造新来源、新数据或新引用。
+2. 只围绕当前小节写作思路补强论证，不新增无关分论点。
+3. 每段以两个全角空格开头；可按论证自然转向分段，不要追求段落长度整齐。
+4. 不要输出字数统计、偏差率、自评、评分、修改说明或过程说明。
+5. 只输出补写后的完整正文。"""
         try:
-            addition_chunks = []
+            rewrite_chunks = []
             if hasattr(self.llm_client, "stream_content"):
-                for chunk in self.llm_client.stream_content(expand_prompt, max_tokens=max(1800, min(12000, int(need_words * 4.0))), temperature=0.6):
+                for chunk in self.llm_client.stream_content(expand_prompt, max_tokens=max(1800, min(12000, int(max(need_words, target_words) * 4.0))), temperature=0.6):
                     if chunk:
-                        addition_chunks.append(str(chunk))
+                        rewrite_chunks.append(str(chunk))
                         self._emit_content_callback(
                             content_callback,
-                            base_content + "\n\n" + "".join(addition_chunks),
+                            "".join(rewrite_chunks),
                             section_title,
                             target_words,
                             generated_index,
                             total_sections,
                         )
-                addition = "".join(addition_chunks)
+                rewritten = "".join(rewrite_chunks)
             else:
-                addition = self.llm_client.generate_content(expand_prompt, max_tokens=max(1800, min(12000, int(need_words * 4.0))), temperature=0.6)
-            addition = self._strip_duplicate_heading(self._sanitize_model_output(addition, section_title), section_title)
-            if addition:
-                return (base_content.rstrip() + "\n\n" + addition.strip()).strip()
+                rewritten = self.llm_client.generate_content(expand_prompt, max_tokens=max(1800, min(12000, int(max(need_words, target_words) * 4.0))), temperature=0.6)
+            rewritten = self._strip_duplicate_heading(self._sanitize_model_output(rewritten, section_title), section_title)
+            if self._has_real_body_content(rewritten):
+                return rewritten.strip()
         except Exception as e:
             self.logger.warning("Failed to expand section %s to target words: %s", section_title, e)
         return base_content
@@ -1171,17 +1172,19 @@ class ChapterWriterAgent(Agent):
         generated_index: int = 1,
         total_sections: int = 1,
     ) -> str:
-        """系统统计中文字数，并在 ±10% 外最多执行 2 次补写或压缩。"""
+        """系统统计中文字数，并在 ±5% 外最多执行 2 次补写或压缩；2 次后 ±8% 可接受。"""
         if not content or not target_words:
             return content or ""
         repaired = str(content).strip()
-        lower_bound = max(1, int(target_words * 0.90))
-        upper_bound = max(lower_bound + 1, int(target_words * 1.10))
-        for _ in range(2):
+        strict_lower = max(1, int(target_words * 0.95))
+        strict_upper = max(strict_lower + 1, int(target_words * 1.05))
+        final_lower = max(1, int(target_words * 0.92))
+        final_upper = max(final_lower + 1, int(target_words * 1.08))
+        for round_index in range(2):
             current_words = self._count_words(repaired)
-            if lower_bound <= current_words <= upper_bound:
+            if strict_lower <= current_words <= strict_upper:
                 break
-            if current_words < lower_bound:
+            if current_words < strict_lower:
                 next_text = self._expand_to_target_words(
                     base_content=repaired,
                     prompt=prompt,
@@ -1207,6 +1210,17 @@ class ChapterWriterAgent(Agent):
             if not self._has_real_body_content(next_text) or next_text.strip() == repaired.strip():
                 break
             repaired = next_text.strip()
+            repaired_words = self._count_words(repaired)
+            if strict_lower <= repaired_words <= strict_upper:
+                break
+            if round_index == 1 and final_lower <= repaired_words <= final_upper:
+                self.logger.info(
+                    "Word count repair accepted within final tolerance for section %s: current=%s target=%s",
+                    section_title,
+                    repaired_words,
+                    target_words,
+                )
+                break
         return repaired
 
     def _split_sentences(self, text: str) -> List[str]:

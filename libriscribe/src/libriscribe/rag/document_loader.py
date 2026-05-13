@@ -4,9 +4,12 @@
 支持 PDF/Word/Excel/TXT/Markdown 文件的解析和分块。
 """
 
+import json
 import logging
 import hashlib
+import os
 import re
+import time
 from pathlib import Path
 from typing import List, Dict, Any, Optional
 from dataclasses import dataclass, field
@@ -130,24 +133,188 @@ class DocumentLoader:
         return all_chunks
 
     def _load_pdf(self, file_path: str) -> str:
-        """解析 PDF 文件"""
+        """解析 PDF 文件。
+
+        优先走本地文本抽取；如果 PDF 是扫描件、unstructured 解析异常，或 PyPDF2 抽取为空，
+        再按需调用 PaddleOCR 在线接口做最小化文字识别兜底。
+        """
+        text = ""
+
         try:
             from unstructured.partition.pdf import partition_pdf
             elements = partition_pdf(filename=file_path)
-            return "\n\n".join([str(el) for el in elements if str(el).strip()])
+            text = "\n\n".join([str(el) for el in elements if str(el).strip()])
+            if self._clean_extracted_text(text).strip():
+                return text
+            logger.warning("unstructured PDF parsing produced no usable text for %s; trying PyPDF2 fallback", file_path)
         except ImportError:
             logger.warning("unstructured not installed, trying PyPDF2 fallback")
-            try:
-                import PyPDF2
-                text = ""
-                with open(file_path, "rb") as f:
-                    reader = PyPDF2.PdfReader(f)
-                    for page in reader.pages:
-                        text += page.extract_text() + "\n\n"
+        except Exception as e:
+            logger.warning("unstructured PDF parsing failed for %s: %s; trying PyPDF2 fallback", file_path, e)
+
+        try:
+            import PyPDF2
+            parts = []
+            with open(file_path, "rb") as f:
+                reader = PyPDF2.PdfReader(f)
+                for page in reader.pages:
+                    page_text = page.extract_text() or ""
+                    if page_text.strip():
+                        parts.append(page_text)
+            text = "\n\n".join(parts)
+            if self._clean_extracted_text(text).strip():
                 return text
-            except ImportError:
-                logger.error("No PDF library available. Install unstructured or PyPDF2")
+            logger.warning("PyPDF2 produced no usable text for %s; trying PaddleOCR fallback", file_path)
+        except ImportError:
+            logger.warning("PyPDF2 not installed; trying PaddleOCR fallback")
+        except Exception as e:
+            logger.warning("PyPDF2 PDF parsing failed for %s: %s; trying PaddleOCR fallback", file_path, e)
+
+        ocr_text = self._load_pdf_with_paddleocr(file_path)
+        if ocr_text.strip():
+            return ocr_text
+        logger.error("No PDF parser succeeded for %s. Install unstructured/PyPDF2 or configure PaddleOCR token.", file_path)
+        return ""
+
+    def _load_pdf_with_paddleocr(self, file_path: str) -> str:
+        """使用 PaddleOCR AIStudio 在线接口识别 PDF 文字，返回纯文本。
+
+        配置方式：设置环境变量 PADDLEOCR_AISTUDIO_TOKEN；可选设置
+        PADDLEOCR_AISTUDIO_MODEL、PADDLEOCR_AISTUDIO_JOB_URL、PADDLEOCR_AISTUDIO_TIMEOUT_SECONDS。
+        """
+        token = os.getenv("PADDLEOCR_AISTUDIO_TOKEN", "").strip()
+        if not token:
+            logger.warning("PaddleOCR fallback skipped: PADDLEOCR_AISTUDIO_TOKEN is not configured")
+            return ""
+
+        try:
+            import requests
+        except ImportError:
+            logger.warning("PaddleOCR fallback skipped: requests is not installed")
+            return ""
+
+        job_url = os.getenv("PADDLEOCR_AISTUDIO_JOB_URL", "https://paddleocr.aistudio-app.com/api/v2/ocr/jobs").strip()
+        model = os.getenv("PADDLEOCR_AISTUDIO_MODEL", "PP-OCRv5").strip() or "PP-OCRv5"
+        timeout_seconds = self._safe_int(os.getenv("PADDLEOCR_AISTUDIO_TIMEOUT_SECONDS"), 180)
+        optional_payload = {
+            "useDocOrientationClassify": False,
+            "useDocUnwarping": False,
+            "useTextlineOrientation": False,
+        }
+        headers = {"Authorization": f"bearer {token}"}
+
+        try:
+            with open(file_path, "rb") as f:
+                response = requests.post(
+                    job_url,
+                    headers=headers,
+                    data={"model": model, "optionalPayload": json.dumps(optional_payload)},
+                    files={"file": f},
+                    timeout=60,
+                )
+            if response.status_code != 200:
+                logger.warning("PaddleOCR job submit failed for %s: %s %s", file_path, response.status_code, response.text[:500])
                 return ""
+            job_id = (response.json().get("data") or {}).get("jobId", "")
+            if not job_id:
+                logger.warning("PaddleOCR job submit returned no jobId for %s: %s", file_path, response.text[:500])
+                return ""
+
+            deadline = time.time() + max(30, timeout_seconds)
+            jsonl_url = ""
+            while time.time() < deadline:
+                result_response = requests.get(f"{job_url}/{job_id}", headers=headers, timeout=30)
+                if result_response.status_code != 200:
+                    logger.warning("PaddleOCR polling failed for %s: %s %s", file_path, result_response.status_code, result_response.text[:500])
+                    return ""
+                payload = result_response.json().get("data") or {}
+                state = payload.get("state", "")
+                if state == "done":
+                    jsonl_url = ((payload.get("resultUrl") or {}).get("jsonUrl") or "").strip()
+                    break
+                if state == "failed":
+                    logger.warning("PaddleOCR job failed for %s: %s", file_path, payload.get("errorMsg", "unknown error"))
+                    return ""
+                time.sleep(5)
+
+            if not jsonl_url:
+                logger.warning("PaddleOCR job timed out for %s", file_path)
+                return ""
+
+            jsonl_response = requests.get(jsonl_url, timeout=60)
+            jsonl_response.raise_for_status()
+            return self._extract_paddleocr_jsonl_text(jsonl_response.text)
+        except Exception as e:
+            logger.warning("PaddleOCR fallback failed for %s: %s", file_path, e)
+            return ""
+
+    def _extract_paddleocr_jsonl_text(self, jsonl_text: str) -> str:
+        """从 PaddleOCR JSONL 结果中尽量抽取纯文本，不下载图片。"""
+        pages: list[str] = []
+        for raw_line in str(jsonl_text or "").splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            result = record.get("result", record)
+            page_text = self._collect_text_from_ocr_object(result)
+            if page_text.strip():
+                pages.append(page_text.strip())
+        return "\n\n".join(self._dedupe_text_lines(pages))
+
+    def _collect_text_from_ocr_object(self, value: Any) -> str:
+        """兼容不同 PaddleOCR 返回结构，递归提取 recText/text/content 等文字字段。"""
+        text_fields = {"recText", "text", "content", "transcription", "label", "words"}
+        parts: list[str] = []
+        if isinstance(value, dict):
+            for key in ("recTexts", "texts", "textLines", "ocrResults", "prunedResult"):
+                nested = value.get(key)
+                if nested is not None:
+                    nested_text = self._collect_text_from_ocr_object(nested)
+                    if nested_text:
+                        parts.append(nested_text)
+            for key, nested in value.items():
+                if key in text_fields and isinstance(nested, str) and nested.strip():
+                    parts.append(nested.strip())
+                elif key not in {"ocrImage", "image", "bbox", "points", "score"} and isinstance(nested, (dict, list, tuple)):
+                    nested_text = self._collect_text_from_ocr_object(nested)
+                    if nested_text:
+                        parts.append(nested_text)
+        elif isinstance(value, (list, tuple)):
+            for item in value:
+                if isinstance(item, str) and item.strip():
+                    parts.append(item.strip())
+                    continue
+                nested_text = self._collect_text_from_ocr_object(item)
+                if nested_text:
+                    parts.append(nested_text)
+        elif isinstance(value, str) and value.strip():
+            parts.append(value.strip())
+        return "\n".join(self._dedupe_text_lines(parts)).strip()
+
+    @staticmethod
+    def _dedupe_text_lines(lines: list[str]) -> list[str]:
+        """保持顺序去重 OCR 文本，避免递归兼容解析造成重复片段。"""
+        deduped: list[str] = []
+        seen: set[str] = set()
+        for item in lines:
+            for raw_line in str(item or "").splitlines():
+                line = raw_line.strip()
+                if not line or line in seen:
+                    continue
+                seen.add(line)
+                deduped.append(line)
+        return deduped
+
+    @staticmethod
+    def _safe_int(value: Any, default: int) -> int:
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return default
 
     def _load_docx(self, file_path: str) -> str:
         """解析 Word 文件。

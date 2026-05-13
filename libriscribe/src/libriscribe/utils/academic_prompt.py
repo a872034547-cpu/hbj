@@ -65,7 +65,7 @@ ACADEMIC_MONOGRAPH_SYSTEM_PROMPT = """# 学术专著分章生成系统提示词�
 | 维度 | 分值 | 扣分标准 |
 |------|------|----------|
 | 编号连续性与一致性 | 10 | 当前章内跳号、重号、标题层级混乱扣5-10分 |
-| 字数偏差（±20%内） | 10 | 当前章/当前写作单元偏差每超过5个百分点扣2分 |
+| 字数偏差（±5%内） | 10 | 当前章/当前写作单元偏差超过5%后，每增加5个百分点扣2分 |
 | 资料分类与引用正确性 | 10 | 当前章误用内部资料、虚构来源、无来源却写引用式句子扣3-10分 |
 | 参考文献格式规范性 | 10 | 仅在当前章/末章实际存在真实参考文献时检查格式；无真实参考文献不得扣分 |
 | 语言客观性与语法正确性 | 10 | 第一人称、主观词、明显语病、非学术表达每处扣1分 |
@@ -121,9 +121,11 @@ def _score_word_deviation(actual: int, target_words: int) -> Tuple[int, str]:
     if not target_words:
         return 8, "未提供目标字数"
     deviation = abs(actual - target_words) / max(target_words, 1)
-    if deviation <= 0.2:
+    # 质量评分与生成后系统裁判保持一致：±5% 内满分，超过后每 5 个百分点扣 2 分。
+    # 字数统计、偏差判断、补写和压缩由代码完成，不要求模型自行数字数。
+    if deviation <= 0.05:
         return 10, f"偏差{deviation:.0%}"
-    excess_steps = int(((deviation - 0.2) * 100 + 4.999) // 5)
+    excess_steps = int(((deviation - 0.05) * 100 + 4.999) // 5)
     score = max(0, 10 - excess_steps * 2)
     return score, f"偏差{deviation:.0%}"
 

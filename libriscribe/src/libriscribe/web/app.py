@@ -4345,7 +4345,8 @@ def render_editor_page() -> None:
         st.caption("这里单独生成/编辑“前言、结语、参考文献”。保存或生成后会自动进入最终书稿：前言在第一章前，结语在最后一章后，参考文献在结语后。")
         for part_key, meta in MANUSCRIPT_PARTS.items():
             current_part_content = _read_manuscript_part(project, part_key)
-            with st.expander(f"{meta['title']} · {'已纳入书稿' if current_part_content.strip() else '待生成'}", expanded=False):
+            has_effective_content = bool(_reference_entry_lines(current_part_content)) if part_key == "references" else bool(current_part_content.strip())
+            with st.expander(f"{meta['title']} · {'已纳入书稿' if has_effective_content else '待生成'}", expanded=False):
                 st.caption(meta["description"])
                 generation_requirement = st.text_area(
                     f"{meta['title']}生成要求",
@@ -5065,7 +5066,12 @@ def _manuscript_part_chapter_overview(project: ProjectKnowledgeBase) -> str:
 def _manuscript_part_citation_context(project: ProjectKnowledgeBase) -> str:
     citations = []
     for citation in getattr(project, "citations", [])[:120]:
-        formatted = getattr(citation, "formatted", "") or getattr(citation, "raw_text", "") or getattr(citation, "title", "")
+        formatted = (
+            getattr(citation, "formatted_ref", "")
+            or getattr(citation, "formatted", "")
+            or getattr(citation, "raw_text", "")
+            or getattr(citation, "title", "")
+        )
         if formatted:
             citations.append(str(formatted).strip())
     material_context = _material_library_context(project, limit=6000, max_chunks=10)
@@ -5074,6 +5080,139 @@ def _manuscript_part_citation_context(project: ProjectKnowledgeBase) -> str:
 
 【资料库可用依据片段】
 {material_context or '暂无可用资料库片段。'}"""
+
+
+def _reference_entry_lines(content: str) -> list[str]:
+    """提取真实参考文献条目行，避免只有标题或 AI 内部资料被当作生成成功。"""
+    lines = []
+    invalid_markers = (
+        "[ai_assistant]",
+        "ai_analysis_not_verified_citation",
+        "AI资料助手",
+        "AI 资料助手",
+        "头脑风暴",
+        "检索词",
+    )
+    for raw_line in str(content or "").replace("\r\n", "\n").replace("\r", "\n").splitlines():
+        line = raw_line.strip()
+        if not line or re.fullmatch(r"#*\s*参考文献\s*", line):
+            continue
+        if any(marker.lower() in line.lower() for marker in invalid_markers):
+            continue
+        if re.search(r"\[[JMCDEPRZS]\]|^\s*\[?\d+\]?\s*[^\s]", line, flags=re.IGNORECASE):
+            lines.append(line)
+    return lines
+
+
+def _project_reference_search_query(project: ProjectKnowledgeBase, requirement: str = "") -> str:
+    """为参考文献兜底检索拼接尽量短、稳定的真实主题检索词。"""
+    parts = [
+        requirement,
+        getattr(project, "title", ""),
+        getattr(project, "project_name", ""),
+        getattr(project, "genre", ""),
+        getattr(project, "category", ""),
+        getattr(project, "description", ""),
+    ]
+    for ch_num in sorted(getattr(project, "chapters", {}).keys()):
+        ch = project.chapters[ch_num]
+        parts.append(getattr(ch, "title", ""))
+        parts.extend(getattr(sec, "title", "") for sec in getattr(ch, "sections", [])[:4])
+    query = _join_project_context_parts(parts, separator=" ", limit=900)
+    return query or str(getattr(project, "title", "") or getattr(project, "project_name", "") or "").strip()
+
+
+def _project_existing_reference_text(project: ProjectKnowledgeBase) -> str:
+    """从已导入 citation 和资料库来源拼出可保存的参考文献兜底文本。"""
+    refs: list[str] = []
+    seen: set[str] = set()
+
+    def add_ref(value: str) -> None:
+        ref = re.sub(r"^\s*\[?\d+\]?\s*", "", str(value or "").strip())
+        ref = re.sub(r"\s+", " ", ref).strip()
+        if not ref or ref in seen:
+            return
+        if not _reference_entry_lines(f"[1] {ref}"):
+            return
+        seen.add(ref)
+        refs.append(ref)
+
+    for citation in getattr(project, "citations", []) or []:
+        add_ref(
+            getattr(citation, "formatted_ref", "")
+            or getattr(citation, "raw_text", "")
+            or (getattr(citation, "metadata", {}) or {}).get("raw_reference", "")
+            or getattr(citation, "source", "")
+        )
+
+    for doc in getattr(project, "source_documents", []) or []:
+        metadata = getattr(doc, "metadata", {}) or {}
+        source_type = str(getattr(doc, "source_type", "") or "Z")
+        if source_type == "ai_assistant" or metadata.get("verification_status") == "ai_analysis_not_verified_citation":
+            continue
+        title = getattr(doc, "title", "") or getattr(doc, "file_name", "")
+        if not title:
+            continue
+        authors = "，".join(getattr(doc, "authors", []) or [])
+        year = getattr(doc, "year", "") or ""
+        publisher = metadata.get("publisher", "")
+        url = getattr(doc, "url", "")
+        doi = getattr(doc, "doi", "")
+        isbn = getattr(doc, "isbn", "")
+        if publisher and year:
+            add_ref(f"{authors + '．' if authors else ''}{title}[{source_type}]．{publisher}，{year}．")
+        elif url or doi or isbn:
+            suffix = url or (f"DOI:{doi}" if doi else f"ISBN:{isbn}")
+            add_ref(f"{authors + '．' if authors else ''}{title}[{source_type}/OL]．{year or '出版年不详'}．{suffix}")
+
+    if not refs:
+        return ""
+    return "参考文献\n\n" + "\n".join(f"[{idx}] {ref}" for idx, ref in enumerate(refs, 1))
+
+
+def _openalex_reference_fallback_text(project: ProjectKnowledgeBase, requirement: str = "", options: Optional[dict[str, Any]] = None) -> str:
+    """AI 参考文献生成超时时，直接用 OpenAlex 检索真实文献并写入 citation 记录。"""
+    options = options or {}
+    query = _project_reference_search_query(project, requirement)
+    if not query:
+        return ""
+    ref_count = max(15, min(35, int(options.get("refCount") or 30)))
+    ref_start_year = int(options.get("refStartYear") or 2019)
+    ref_end_year = int(options.get("refEndYear") or 2026)
+    language_distribution = str(options.get("languageDistribution") or "")
+    language_filter = "zh" if "中文" in language_distribution and "英文" not in language_distribution else "all"
+    service = LiteratureSearchService()
+    try:
+        diagnostics = service.search_with_diagnostics(
+            query,
+            limit=min(10, ref_count),
+            api_key=str(st.session_state.get("openalex_api_key", "") or ""),
+            recent_years=None,
+            journal_only=True,
+            timeout=12,
+            search_mode="semantic" if len(query) > 80 else "keyword",
+            language_filter=language_filter,
+        )
+    except Exception:
+        logger.exception("OpenAlex reference fallback failed")
+        return ""
+    citations: list[str] = []
+    for item in diagnostics.get("items") or []:
+        year = _safe_int(item.get("publication_year"), 0)
+        if year and not (ref_start_year <= year <= ref_end_year):
+            continue
+        formatted = service.format_citation(item, len(citations) + 1)
+        if formatted and _reference_entry_lines(formatted):
+            citations.append(formatted)
+        if len(citations) >= ref_count:
+            break
+    if not citations:
+        return ""
+    try:
+        service.import_formatted_citations(project, citations, keywords=query)
+    except Exception:
+        logger.exception("Import OpenAlex fallback citations failed")
+    return "参考文献\n\n" + "\n".join(citations)
 
 
 def _build_manuscript_part_prompt(
@@ -5285,17 +5424,45 @@ def _generate_manuscript_part_with_ai(
         project.project_dir = str(Path(project_file).parent)
     try:
         options = _manuscript_part_generation_options_from_state(part_key, options)
-        prompt = _build_manuscript_part_prompt(project, part_key, requirement, options)
         target_words = _target_word_count_for_part(part_key, options)
         part_title = MANUSCRIPT_PARTS[part_key]['title']
+        prompt = _build_manuscript_part_prompt(project, part_key, requirement, options)
         generation_kwargs: dict[str, Any] = {"max_tokens": 6000, "temperature": 0.25}
+        existing_reference_text = ""
         if part_key == "references":
-            generation_kwargs.update({"max_tokens": 2800, "temperature": 0.2, "timeout_seconds": 45, "raw_attempt_limit": 2})
+            existing_reference_text = str(st.session_state.get("manuscript_part_references") or _read_manuscript_part(project, "references") or "").strip()
+            generation_kwargs.update({"max_tokens": 1200, "temperature": 0.2, "timeout_seconds": 75, "raw_attempt_limit": 2})
         with st.spinner(f"AI 正在生成{part_title}…"):
             content = client.generate_content(prompt, **generation_kwargs)
         if not content and getattr(client, "last_error", ""):
-            raise RuntimeError(getattr(client, "last_error"))
+            if part_key == "references":
+                fallback_refs = _project_existing_reference_text(project)
+                if not fallback_refs:
+                    fallback_refs = _openalex_reference_fallback_text(project, requirement, options)
+                if fallback_refs:
+                    st.warning("模型接口超时，已改用项目真实 citation/来源记录或 OpenAlex 检索结果生成参考文献，避免保存空内容。")
+                    content = fallback_refs
+                elif _reference_entry_lines(existing_reference_text):
+                    st.warning("模型接口超时，已保留编辑框中已有的有效参考文献，未写入空内容。")
+                    content = existing_reference_text
+                else:
+                    raise RuntimeError(getattr(client, "last_error"))
+            else:
+                raise RuntimeError(getattr(client, "last_error"))
         cleaned = _sanitize_generated_manuscript_part(part_key, str(content or "").strip())
+        if part_key == "references" and not _reference_entry_lines(cleaned):
+            fallback_refs = _project_existing_reference_text(project)
+            if not fallback_refs:
+                fallback_refs = _openalex_reference_fallback_text(project, requirement, options)
+            if fallback_refs:
+                cleaned = _sanitize_generated_manuscript_part(part_key, fallback_refs)
+                st.warning("AI 未返回有效参考文献条目，已改用项目真实 citation/来源记录或 OpenAlex 检索结果生成参考文献。")
+            elif _reference_entry_lines(existing_reference_text):
+                cleaned = _sanitize_generated_manuscript_part(part_key, existing_reference_text)
+                st.warning("AI 未返回有效参考文献条目，已保留编辑框中已有的有效参考文献。")
+            else:
+                st.error("参考文献生成结果没有有效条目，未写入正文。当前项目没有真实 citation 记录；请先在「引用管理」粘贴参考文献，或在「资料与检索」使用 OpenAlex 导入真实引用后重试。")
+                return
         if part_key in {"preface", "conclusion"} and target_words:
             min_words = int(target_words * 0.92)
             max_words = int(target_words * 1.08)
@@ -7590,33 +7757,39 @@ def _render_global_prompts_editor(*, expanded_first: bool = False) -> None:
     prompt_service = PromptService()
     prompts = prompt_service.list_all_global_prompts()
     st.markdown("### 全局提示词（中文说明 + 范文）")
-    st.caption("正文生成读取“章节正文写作”；大纲生成读取“大纲生成与优化”。英文模板名已隐藏到高级信息，页面主视图只展示中文名称、用途、范文和可编辑提示词。")
+    st.caption("正文生成读取“章节正文写作”；大纲生成读取“大纲生成与优化”；写章节页的前言、结语/总结、参考文献生成分别读取对应提示词。英文模板名已隐藏到高级信息，页面主视图只展示中文名称、用途、范文和可编辑提示词。")
     if not prompts:
         st.warning("没有找到全局提示词模板。")
         return
 
-    active_prompts = [prompt for prompt in prompts if prompt.get("key") == "chapter_writer"]
-    backup_prompts = [prompt for prompt in prompts if prompt.get("key") != "chapter_writer"]
+    active_keys = {"chapter_writer", "outliner", "manuscript_preface", "manuscript_conclusion", "manuscript_references"}
+    active_prompts = [prompt for prompt in prompts if prompt.get("key") in active_keys]
+    backup_prompts = [prompt for prompt in prompts if prompt.get("key") not in active_keys]
     ordered_prompts = active_prompts + backup_prompts
 
     for index, prompt in enumerate(ordered_prompts):
         key = prompt.get("key", "")
         is_active = bool(prompt.get("is_active") or key == "chapter_writer")
         is_outline = key == "outliner"
+        is_manuscript_part = key in {"manuscript_preface", "manuscript_conclusion", "manuscript_references"}
         title = f"{prompt.get('name') or '未命名提示词'}"
-        if is_active:
+        if key == "chapter_writer":
             title += " · 正文生成正在使用"
         elif is_outline:
             title += " · 大纲生成正在使用"
+        elif is_manuscript_part:
+            title += " · 前后文/文献生成正在使用"
         elif prompt.get("is_customized"):
             title += " · 已自定义备用"
         else:
             title += " · 高级备用"
         with st.expander(title, expanded=(is_active and expanded_first) or (expanded_first and index == 0)):
-            if is_active:
+            if key == "chapter_writer":
                 st.success("这一条是当前章节正文生成实际读取的全局提示词。")
             elif is_outline:
                 st.success("这一条是当前 AI 大纲生成与二次改进实际读取的全局提示词。")
+            elif is_manuscript_part:
+                st.success("这一条是写章节页生成前言、结语/总结或参考文献时实际读取的全局提示词。")
             else:
                 st.info("这是历史/备用模板，当前不会参与章节正文或大纲生成；后续接入对应功能时才会生效。")
             st.caption(prompt.get("description", ""))
@@ -7630,9 +7803,9 @@ def _render_global_prompts_editor(*, expanded_first: bool = False) -> None:
                 st.write(f"原始名称：{prompt.get('original_name') or '-'}")
                 st.write(f"来源：{prompt.get('path') or '-'}")
             edited = st.text_area(
-                "当前生效提示词内容" if (is_active or is_outline) else "备用提示词内容",
+                "当前生效提示词内容" if (is_active or is_outline or is_manuscript_part) else "备用提示词内容",
                 value=prompt.get("current_template", ""),
-                height=500 if (is_active or is_outline) else 260,
+                height=500 if (is_active or is_outline or is_manuscript_part) else 260,
                 key=f"global_prompt_editor_{key}",
                 help="变量请保留大括号格式，例如 {book_title}、{section_title}、{rag_context}。",
             )

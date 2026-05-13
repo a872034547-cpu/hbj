@@ -104,9 +104,136 @@ DEFAULT_CHAPTER_PROMPT_TEMPLATE = """# 学术专著小节写作提示词（Web �
 6. 少用空泛判断，多使用有指向性的动词和名词；每段最好解决一个明确问题，而不是只做姿态化总结。
 """
 
+DEFAULT_MANUSCRIPT_PREFACE_PROMPT_TEMPLATE = """【系统指令】
+你是一名学术专著撰写专家。你的唯一任务是为指定的专著生成“前言”。输出必须是纯文本的前言正文，不包含“前言”二字标题，不包含任何其他内容。
+
+【任务参数】
+- 专著名称：{book_title}
+- 作者：{author}
+- 全书所属学科/领域：{field}
+- 前言预期字数：{target_words} 字；绝对允许范围：{min_words}—{max_words} 字
+
+【全书结构概览】（你撰写的所有内容必须紧扣此框架）
+{chapters}
+
+{common_context}
+
+【写作要求】
+1. 前言应包含：
+   - 研究背景与问题意识：阐述本领域现状、核心矛盾，以及撰写本书的缘由。
+   - 全书主旨与目标：用凝练语言阐明本书要解决的核心问题、核心主张。
+   - 内容导览：基于给定的全书结构，简要说明每一章的研究重点及其逻辑关联。
+   - 致谢（若有）：用自然的方式融入，不单独设节，点到为止。
+2. 语言风格：学术、平实、客观。禁止使用“在当今时代”“随着……发展”“众所周知”等空泛套话。禁止使用“极大地”“颠覆性地”等夸张副词。保持陈述句为主。
+3. 不得超出给定框架虚构章节或内容。
+
+【字数规定 - 绝对红线】
+- 前言全文必须严格控制在 {target_words} 字左右，允许偏差上下不超过 8%，即 {min_words}—{max_words} 字。
+- 生成完毕后你必须自己统计中文字符数（不含空格和标题）并校验；如果超出范围，必须立刻重写精简或补足，直到达标。
+- 自检用的“实际字数”报告只能用于你内部校验，最终输出绝对不能包含任何字数统计。
+
+【输出规则】
+- 直接输出前言正文第一段；不得输出“前言”二字，不得输出 Markdown 标题。
+- 正文结束后直接结束，不留任何空格、换行以外的符号。
+- 绝对禁止输出：字数统计、自评、评分、附录、术语表、任何标记线（如“#####”）。
+"""
+
+DEFAULT_MANUSCRIPT_CONCLUSION_PROMPT_TEMPLATE = """【系统指令】
+你是一名学术专著撰写专家。你的唯一任务是为指定的专著生成“结语”。输出必须是纯文本的结语正文，不包含“结语”二字标题，不包含任何其他内容。
+
+【任务参数】
+- 专著名称：{book_title}
+- 作者：{author}
+- 全书所属学科/领域：{field}
+- 结语预期字数：{target_words} 字；绝对允许范围：{min_words}—{max_words} 字
+
+【全书各章核心结论】（你必须据此总结，不得偏离）
+{chapters}
+
+【前言核心问题与主张】（用于形成前后闭环，若平台未提供则忽略此条）
+{foreword_core_summary}
+
+{common_context}
+
+【写作要求】
+1. 结语必须包含：
+   - 全书主要发现与贡献：提炼全书各章共通的核心成果，形成一个整体性的学术判断。
+   - 实践启示与理论价值（若适用）：指出本成果对领域实践的指导意义。
+   - 研究局限与未来方向：客观、诚实地点出未解决的问题，提出后续可深入的2-3个方向。
+2. 必须与前言形成呼应：若前言提出了核心问题或预设，结语须对此作出明确回答。保持术语、论调一致。
+3. 语言风格：与前言一致，学术、平实、不夸大。
+
+【字数规定 - 绝对红线】
+- 结语全文必须严格控制在 {target_words} 字左右，允许偏差上下不超过 8%，即 {min_words}—{max_words} 字。
+- 生成完毕后你必须自己统计中文字符数（不含空格和标题）并校验；如果超出范围，必须立刻重写精简或补足，直到达标。
+- 自检用的“实际字数”报告只能用于你内部校验，最终输出绝对不能包含任何字数统计。
+
+【输出规则】
+- 直接输出结语正文第一段；不得输出“结语”二字，不得输出 Markdown 标题。
+- 正文结束后直接结束，不允许任何附加信息。
+- 绝对禁止：字数统计、自评、评分、附录、术语表、任何分隔标记。
+"""
+
+DEFAULT_MANUSCRIPT_REFERENCES_PROMPT_TEMPLATE = """你是一名学术参考文献整理与校验专家。
+你的唯一任务是为给生成的文章专著整理一批中文参考文献。
+你输出的内容必须是纯参考文献列表，不包含任何其他信息。
+
+【任务参数】
+- 专著名称：{book_title}
+- 所属学科/领域：{field}
+- 参考文献总数量：{ref_count} 条（控制在15-35条之间）
+- 文献语种分布：{language_distribution}（以中文文献为主；可含少量权威英文文献，但必须以中文为主）
+- 出版/发表时间范围：严格限制为 {ref_start_year} 年至 {ref_end_year} 年
+- 参考文献格式：{citation_style}
+
+【全书结构概览】
+{chapters}
+
+{common_context}
+
+【平台已有引用与资料上下文】
+{citation_context}
+
+【文献类型构成要求】
+1. 必须以 M 类文献（专著、图书）为主体，占到总条目的 80% 以上。
+2. 可以辅以少量期刊论文（[J]）、学位论文（[D]）、会议论文（[C]）等，但期刊论文必须是能够在知网（cnki.net）公开检索到的。
+3. 禁止包含报纸文章（[N]）、一般网络文章（[EB/OL]）、标准（[S]）、专利（[P]）等非学术核心文献。
+
+【真实性硬性约束 - 不可违反】
+1. 你列出的每一条文献，都必须是真实存在的出版物。严禁编造、杜撰、拼凑任何文献。
+2. 对于 M 类文献（专著/图书）：
+   - 必须在条目中完整著录：作者、书名、出版地、出版社、出版年份。
+   - 出版社和出版年份必须是该专著实际对应的准确信息，不可随意匹配。
+   - 如果你对某本书的出版社或出版年份不确定，直接跳过，不列该条目。
+3. 对于期刊论文（[J]）：
+   - 必须能够在中国知网（cnki.net）通过篇名或作者检索到。
+   - 必须在条目中完整著录：作者、篇名、期刊名、年、卷、期、起止页码。
+   - 如果某篇论文你无法确认是否被知网收录，直接跳过。
+4. 对于其他类型文献（如论文集[C]、学位论文[D]），同样要求真实可查。
+
+【生成策略】
+- 你必须在内部进行“可验证性自检”：对每一篇拟输出的文献，确认自己有极高把握它是真实存在的，且出版信息准确。不确定的条目一律舍弃。
+- 为保证真实性，宁可少列几篇，也绝不用不确定的条目凑数。
+- 优先使用平台已有可核验引用记录、资料库来源和已导入的 OpenAlex/DOI/链接文献；但只有确认满足上述类型、年份、格式和真实性要求时才可列入。
+- 如果某个主题下真实存在的文献确实不足以达到请求数量，可以诚实减少输出条目，并在列表末尾用一行“（说明：经校验后确信存在的相关文献共计X条）”，但这一行说明之后不能再添加任何其他文字。
+
+【输出规则】
+1. 输出第一行是“参考文献”四个字（作为标题），空一行后逐条列出参考文献。
+2. 每条文献单独一行，按作者姓氏拼音排序，中文文献在前，英文文献在后。
+3. 正文结束后直接结束，不留任何额外字符、空行或表情符号。
+4. 绝对禁止在正文前后或中间输出以下内容：
+   - 字数统计、自评、评分
+   - 任何过程说明（如“以下是符合要求的文献”）
+   - 术语表、附录
+   - 分隔标记或装饰线
+"""
+
 PROMPT_DISPLAY_NAMES = {
     "chapter_writer": "章节正文写作（当前生效）",
     "outliner": "大纲生成与优化",
+    "manuscript_preface": "前言生成（当前生效）",
+    "manuscript_conclusion": "结语/总结生成（当前生效）",
+    "manuscript_references": "参考文献生成（当前生效）",
     "researcher": "资料研究与文献梳理",
     "fact_checker": "事实核验与反幻觉检查",
     "citation_agent": "引用格式与证据绑定",
@@ -125,6 +252,9 @@ PROMPT_DISPLAY_NAMES = {
 PROMPT_USAGE_NOTES = {
     "chapter_writer": "当前章节正文生成会读取这一条。建议重点维护。",
     "outliner": "用于后续大纲生成/优化接入；当前不参与章节正文生成。",
+    "manuscript_preface": "写章节页生成前言时实际读取这一条；支持在提示词中使用 {book_title}、{target_words}、{chapters} 等变量。",
+    "manuscript_conclusion": "写章节页生成结语/总结时实际读取这一条；支持在提示词中使用 {foreword_core_summary}、{chapters} 等变量。",
+    "manuscript_references": "写章节页 AI 生成参考文献时实际读取这一条；支持在提示词中使用 {ref_count}、{citation_context} 等变量。",
     "researcher": "用于后续资料分析、文献梳理接入；当前不参与章节正文生成。",
     "fact_checker": "用于后续事实核验、反幻觉检查接入；当前不参与章节正文生成。",
     "citation_agent": "用于后续引用格式、证据绑定接入；当前不参与章节正文生成。",
@@ -144,6 +274,9 @@ PROMPT_USAGE_NOTES = {
 PROMPT_EXAMPLES = {
     "chapter_writer": "范文片段：\n　　智慧工地并非单一技术设备的简单叠加，而是施工现场管理方式在数字化条件下的系统重组。它通过感知设备、数据平台和管理流程之间的协同，把质量、安全、进度、成本等原本分散的管理对象纳入同一运行框架之中，从而提升项目治理的连续性和可追溯性。",
     "outliner": "范文格式：\n第一章 智慧工地的生成逻辑与价值定位\n第一节 建筑业数字化转型的现实背景\n一、工程建造方式演进的外部驱动\n（一）城镇建设需求持续升级\n写作思路：从城市更新、基础设施完善和高品质建造需求提升切入，说明工程建造方式升级的现实背景。",
+    "manuscript_preface": "范文片段：\n　　本书围绕智慧工地建设与工程现场数字化管理展开，试图在技术应用与现场治理之间建立更清晰的分析框架。",
+    "manuscript_conclusion": "范文片段：\n　　全书的讨论表明，智慧工地的价值并不止于设备更新，而在于工程现场管理逻辑、数据流转方式和责任协同机制的系统重塑。",
+    "manuscript_references": "范文格式：\n参考文献\n\n[1] 作者．书名[M]．出版地：出版社，年份．\n[2] 作者．篇名[J]．期刊名，年份，卷(期)：起止页码．",
     "researcher": "范文片段：\n资料显示，当前研究主要集中在施工现场感知、BIM 协同、风险预警和平台化治理四个方向。可优先将这些资料对应到“技术基础、应用场景、监管评价、持续优化”等章节。",
     "fact_checker": "范文片段：\n核验结果：文中“某政策明确要求……”缺少来源支撑，建议改为一般表述，或补充政策原文、发布日期、发布机构后再使用。",
     "citation_agent": "范文片段：\n引用建议：[1] 可绑定到“智慧工地平台建设背景”段落；当前缺少页码和出版社信息，导出参考文献前需要补齐。",
@@ -161,14 +294,17 @@ PROMPT_EXAMPLES = {
 
 PROMPT_CHINESE_DEFAULT_TEMPLATES = {
     "outliner": DEFAULT_OUTLINE_PROMPT_TEMPLATE,
+    "manuscript_preface": DEFAULT_MANUSCRIPT_PREFACE_PROMPT_TEMPLATE,
+    "manuscript_conclusion": DEFAULT_MANUSCRIPT_CONCLUSION_PROMPT_TEMPLATE,
+    "manuscript_references": DEFAULT_MANUSCRIPT_REFERENCES_PROMPT_TEMPLATE,
 }
 
 PROMPT_ANALYSIS_GUIDE = """## AI 提示词分析与优化方向
 
 重点检查这些问题：
 
-1. **目标是否明确**：是否说清楚要写“学术专著正文”，还是容易写成报告、论文、新闻稿或口号。
-2. **输入变量是否完整**：必须保留 `{book_title}`、`{chapter_title}`、`{section_title}`、`{target_words}`、`{rag_context}` 等变量，否则生成时缺上下文。
+1. **目标是否明确**：是否说清楚要写“学术专著正文”、前言、结语或参考文献，还是容易写成报告、论文、新闻稿或口号。
+2. **输入变量是否完整**：章节正文必须保留 `{book_title}`、`{chapter_title}`、`{section_title}`、`{target_words}`、`{rag_context}` 等变量；前言/结语/参考文献模板可使用 `{book_title}`、`{author}`、`{field}`、`{target_words}`、`{min_words}`、`{max_words}`、`{chapters}`、`{common_context}`、`{foreword_core_summary}`、`{ref_count}`、`{ref_start_year}`、`{ref_end_year}`、`{citation_style}`、`{language_distribution}`、`{citation_context}`，否则生成时缺上下文。
 3. **资料约束是否清楚**：如果文章质量差或胡编引用，要加强“只使用资料库/RAG，不得编造来源”。
 4. **结构要求是否具体**：质量差通常是因为只写“严谨专业”，没有要求概念界定、机制分析、边界条件、实践意义。
 5. **字数要求是否合理**：目标字数太大而资料不足时，模型容易灌水；建议拆小节或补资料。
@@ -244,14 +380,33 @@ class PromptService:
                     "description": PROMPT_USAGE_NOTES.get(key) or data.get("description") or "",
                     "example": PROMPT_EXAMPLES.get(key) or "范文示例：此模板暂无专门范文，可按当前提示词变量自行补充输出样例。",
                     "version": data.get("version") or "",
-                    "category": "当前生效" if key == "chapter_writer" else "备用模板",
+                    "category": "当前生效" if key in {"chapter_writer", "outliner", "manuscript_preface", "manuscript_conclusion", "manuscript_references"} else "备用模板",
                     "default_template": default_template,
                     "current_template": current_template,
                     "is_customized": key in settings_prompts,
-                    "is_active": key == "chapter_writer",
+                    "is_active": key in {"chapter_writer", "outliner", "manuscript_preface", "manuscript_conclusion", "manuscript_references"},
                     "path": str(path),
                 })
 
+        existing_keys = {item["key"] for item in prompts}
+        for key, default_template in PROMPT_CHINESE_DEFAULT_TEMPLATES.items():
+            if key in existing_keys:
+                continue
+            current_template = str(settings_prompts.get(key) or default_template)
+            prompts.append({
+                "key": key,
+                "name": PROMPT_DISPLAY_NAMES.get(key) or key,
+                "original_name": key,
+                "description": PROMPT_USAGE_NOTES.get(key) or "全局中文内置提示词",
+                "example": PROMPT_EXAMPLES.get(key) or "范文示例：此模板暂无专门范文，可按当前提示词变量自行补充输出样例。",
+                "version": "built-in-cn",
+                "category": "当前生效" if key in {"chapter_writer", "outliner", "manuscript_preface", "manuscript_conclusion", "manuscript_references"} else "内置模板",
+                "default_template": default_template,
+                "current_template": current_template,
+                "is_customized": key in settings_prompts,
+                "is_active": key in {"chapter_writer", "outliner", "manuscript_preface", "manuscript_conclusion", "manuscript_references"},
+                "path": "内置中文默认模板",
+            })
         existing_keys = {item["key"] for item in prompts}
         for key, value in sorted(settings_prompts.items()):
             if key not in existing_keys:
@@ -262,14 +417,21 @@ class PromptService:
                     "description": PROMPT_USAGE_NOTES.get(key) or "全局自定义提示词",
                     "example": PROMPT_EXAMPLES.get(key) or "范文示例：这是自定义提示词，可在提示词正文中补充你期望的范文格式。",
                     "version": "custom",
-                    "category": "当前生效" if key == "chapter_writer" else "自定义备用",
+                    "category": "当前生效" if key in {"chapter_writer", "outliner", "manuscript_preface", "manuscript_conclusion", "manuscript_references"} else "自定义备用",
                     "default_template": "",
                     "current_template": str(value),
                     "is_customized": True,
-                    "is_active": key == "chapter_writer",
+                    "is_active": key in {"chapter_writer", "outliner", "manuscript_preface", "manuscript_conclusion", "manuscript_references"},
                     "path": "config/global_settings.json",
                 })
-        return sorted(prompts, key=lambda item: (0 if item.get("key") == "chapter_writer" else 1, item.get("key", "")))
+        active_order = {
+            "chapter_writer": 0,
+            "outliner": 1,
+            "manuscript_preface": 2,
+            "manuscript_conclusion": 3,
+            "manuscript_references": 4,
+        }
+        return sorted(prompts, key=lambda item: (active_order.get(item.get("key", ""), 99), item.get("key", "")))
 
     @classmethod
     def load_global_prompt(cls, prompt_key: str, default: str = "") -> str:

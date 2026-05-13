@@ -449,18 +449,52 @@ def clean_text(value: Any) -> str:
     return add_cjk_spacing(text.strip())
 
 
+SELF_ASSESSMENT_MARKER_RE = re.compile(r"^\s*【\s*自评(?:结果|打分)\s*】\s*$")
+SELF_ASSESSMENT_SPLIT_RE = re.compile(r"\n?\s*【\s*自评(?:结果|打分)\s*】", re.MULTILINE)
+SELF_ASSESSMENT_LINE_RE = re.compile(
+    r"^\s*(?:"
+    r"编号连续性与一致性|字数偏差|资料分类与引用正确性|参考文献格式规范性|语言客观性|"
+    r"(?:AI\s*)?评分|得分|总分|质量自检|自检评分|评分表|评审结果|审核结果"
+    r")\s*[：:]",
+    re.IGNORECASE,
+)
+
+
+def strip_export_self_assessment(value: Any) -> str:
+    """导出 Word 前移除章节自评/评分等过程信息，不影响网页章节预览原文。"""
+    text = "" if value is None else str(value)
+    text = text.replace("\ufeff", "").replace("\r\n", "\n").replace("\r", "\n")
+    text = SELF_ASSESSMENT_SPLIT_RE.split(text, maxsplit=1)[0]
+    kept_lines: list[str] = []
+    for line in text.splitlines():
+        if SELF_ASSESSMENT_MARKER_RE.match(line) or SELF_ASSESSMENT_LINE_RE.search(line):
+            continue
+        kept_lines.append(line)
+    return "\n".join(kept_lines).strip()
+
+
 def iter_paragraph_texts(content: Any) -> Iterable[str]:
     """把字符串、列表、字典等输入统一展开为段落。"""
     if content is None:
         return
     if isinstance(content, str):
+        content = strip_export_self_assessment(content)
         for part in re.split(r"\n\s*\n", content):
             cleaned = clean_text(part)
             if cleaned:
                 yield cleaned
         return
     if isinstance(content, (list, tuple)):
+        skipping_self_assessment = False
         for item in content:
+            if isinstance(item, str) and SELF_ASSESSMENT_MARKER_RE.match(item.strip()):
+                skipping_self_assessment = True
+                continue
+            if skipping_self_assessment:
+                item_text = "" if item is None else str(item)
+                if not item_text.strip() or SELF_ASSESSMENT_LINE_RE.search(item_text.strip()):
+                    continue
+                skipping_self_assessment = False
             yield from iter_paragraph_texts(item)
         return
     if isinstance(content, dict):
@@ -468,7 +502,7 @@ def iter_paragraph_texts(content: Any) -> Iterable[str]:
             if key in content:
                 yield from iter_paragraph_texts(content[key])
         return
-    cleaned = clean_text(content)
+    cleaned = clean_text(strip_export_self_assessment(content))
     if cleaned:
         yield cleaned
 

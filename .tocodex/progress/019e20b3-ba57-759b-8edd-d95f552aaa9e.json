@@ -1,0 +1,17 @@
+{
+  "taskId": "019e20b3-ba57-759b-8edd-d95f552aaa9e",
+  "todos": [
+    {
+      "id": "41826e51126372524a175f7b08a80797",
+      "content": "分析不影响功能质量的 token 优化策略",
+      "status": "completed"
+    },
+    {
+      "id": "f34956c83097600830defc764f3bc84d",
+      "content": "给出适合当前项目的低风险优化方案",
+      "status": "completed"
+    }
+  ],
+  "lastUpdated": 1778682481240,
+  "status": "active"
+}
