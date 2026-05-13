@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 import re
 from pathlib import Path
-from typing import Optional, Dict, List, Sequence
+from typing import Optional, Dict, List, Sequence, Tuple
 from libriscribe.agents.agent_base import Agent
 from libriscribe.utils import prompts_context as prompts
 from libriscribe.utils.file_utils import read_markdown_file, read_json_file, write_markdown_file, extract_json_from_markdown
@@ -347,7 +347,20 @@ class ChapterWriterAgent(Agent):
             section_content = self._finalize_section_content(section_content, section_title, target_words)
             actual_words = self._count_words(section_content)
             section.actual_word_count = actual_words
-            section.status = "completed"
+            section.word_count_target = int(target_words or 0)
+            section.word_count_actual = actual_words
+            if target_words and actual_words > int(target_words * 1.15):
+                section.status = "word_count_soft_fail"
+                section.word_count_status = "word_count_soft_fail"
+                section.word_count_note = (
+                    f"目标 {target_words} 字，当前约 {actual_words} 字；已经过两轮 AI 协商压缩和一次 token 上限压缩，"
+                    "为保证文章质量未做代码裁剪，正文已放行并建议人工复核。"
+                )
+                self.logger.warning("Section %s marked word_count_soft_fail: target=%s actual=%s", section_title, target_words, actual_words)
+            else:
+                section.status = "completed"
+                section.word_count_status = "ok"
+                section.word_count_note = ""
             generated_summaries.append(f"{section_title}: {section_content[:240]}")
             content_parts.append(f"{markdown_level} {section_title}\n\n{section_content.strip()}\n")
             if content_callback:
@@ -849,22 +862,50 @@ class ChapterWriterAgent(Agent):
 9. 少用双引号，普通判断句和概念直接陈述；只保留直接引语、术语首次界定或特殊含义临时用法。
 """
 
-    def _compress_to_target_words(
-        self,
-        content: str,
-        prompt: str,
-        section_title: str,
-        target_words: int,
-        current_words: int,
-        content_callback=None,
-        generated_index: int = 1,
-        total_sections: int = 1,
-    ) -> str:
-        """模型初稿明显超出目标字数时，先让模型保留论证骨架进行压缩。"""
-        if current_words <= max(1, int(target_words * 1.05)):
-            return content
+    def _estimate_output_tokens(self, text: str) -> int:
+        """估算一次生成正文的 completion tokens；优先使用 tiktoken，缺失时用保守字符启发式。"""
+        value = str(text or "")
+        if not value:
+            return 0
+        try:
+            import tiktoken  # type: ignore
+            encoding = tiktoken.get_encoding("cl100k_base")
+            return len(encoding.encode(value))
+        except Exception:
+            chinese = self._count_words(value)
+            ascii_chars = len(re.findall(r"[A-Za-z0-9]", value))
+            other_chars = max(0, len(value) - chinese - ascii_chars)
+            return max(1, int(chinese / 0.6) + int(ascii_chars / 4) + int(other_chars / 2))
+
+    def _last_completion_token_count(self, text: str) -> int:
+        """读取模型返回的 completion token；没有 usage 时退回本地估算。"""
+        completion_tokens = int(getattr(self.llm_client, "last_completion_tokens", 0) or 0)
+        total_tokens = int(getattr(self.llm_client, "last_total_tokens", 0) or 0)
+        if completion_tokens > 0:
+            return completion_tokens
+        if total_tokens > 0:
+            # 仅拿到 total_tokens 时不能直接当 completion 上限，但可作为保守历史样本。
+            return total_tokens
+        return self._estimate_output_tokens(text)
+
+    def _record_generation_history(self, history: List[Tuple[int, int]], text: str) -> None:
+        """记录当前尝试的 token 与中文字数历史；异常值直接忽略。"""
+        words = self._count_words(text)
+        tokens = self._last_completion_token_count(text)
+        if tokens > 0 and words > 0:
+            history.append((tokens, words))
+
+    def _estimate_token_cap(self, target_words: int, history: List[Tuple[int, int]], safety_factor: float = 0.9) -> int:
+        """根据历史中文字数/token 比估算 completion max_tokens。"""
+        ratios = [cw / tk for tk, cw in history if tk > 0 and cw > 0]
+        avg_ratio = sum(ratios) / len(ratios) if ratios else 0.6
+        avg_ratio = max(0.3, min(avg_ratio, 1.2))
+        estimated = int((max(1, target_words) / avg_ratio) * safety_factor)
+        return max(300, min(6000, estimated))
+
+    def _build_word_count_compress_prompt(self, content: str, prompt: str, target_words: int, current_words: int) -> str:
         delete_words = max(1, current_words - target_words)
-        compress_prompt = f"""{prompt}
+        return f"""{prompt}
 
 ## 已生成正文（系统统计后超出目标范围）
 {content}
@@ -880,6 +921,39 @@ class ChapterWriterAgent(Agent):
 3. 少用双引号，普通判断句和概念直接陈述。
 4. 只输出压缩后的完整正文段落，每段以两个全角空格开头；可按论证自然转向分段，不要追求段落长度整齐。
 5. 不要输出字数统计、偏差率、自评、评分、修改说明或过程说明。"""
+
+    def generate_with_token_cap(
+        self,
+        prompt: str,
+        target_words: int,
+        history: List[Tuple[int, int]],
+        section_title: str = "",
+    ) -> str:
+        """基于历史 token/中文字数比设置 completion max_tokens，只限制 API 参数，不把 token cap 写入提示词。"""
+        max_tokens = self._estimate_token_cap(target_words, history, safety_factor=0.9)
+        self.logger.info("Token-capped word repair for section %s: target=%s max_tokens=%s history=%s", section_title, target_words, max_tokens, history)
+        return self.llm_client.generate_content(
+            prompt,
+            max_tokens=max_tokens,
+            temperature=0.5,
+            raw_attempt_limit=1,
+        )
+
+    def _compress_to_target_words(
+        self,
+        content: str,
+        prompt: str,
+        section_title: str,
+        target_words: int,
+        current_words: int,
+        content_callback=None,
+        generated_index: int = 1,
+        total_sections: int = 1,
+    ) -> str:
+        """模型初稿明显超出目标字数时，先让模型保留论证骨架进行压缩。"""
+        if current_words <= max(1, int(target_words * 1.05)):
+            return content
+        compress_prompt = self._build_word_count_compress_prompt(content, prompt, target_words, current_words)
         if content_callback:
             content_callback("_字数超出目标范围，正在压缩正文..._", section_title, generated_index, total_sections)
         try:
@@ -894,7 +968,7 @@ class ChapterWriterAgent(Agent):
                 self._emit_content_callback(content_callback, compressed, section_title, target_words, generated_index, total_sections)
                 return compressed
             self.logger.warning(
-                "Compression for section %s returned no valid body: before=%s after=%s target=%s; using deterministic trim.",
+                "Compression for section %s returned no valid body: before=%s after=%s target=%s; keeping current content for quality.",
                 section_title,
                 current_words,
                 compressed_words,
@@ -1172,14 +1246,18 @@ class ChapterWriterAgent(Agent):
         generated_index: int = 1,
         total_sections: int = 1,
     ) -> str:
-        """系统统计中文字数，并在 ±5% 外最多执行 2 次补写或压缩；2 次后 ±8% 可接受。"""
+        """系统统计中文字数：两轮 AI 协商修正后，严重超标时追加一次 token 上限压缩；不做代码裁剪。"""
         if not content or not target_words:
             return content or ""
         repaired = str(content).strip()
+        history: List[Tuple[int, int]] = []
+        self._record_generation_history(history, repaired)
         strict_lower = max(1, int(target_words * 0.95))
         strict_upper = max(strict_lower + 1, int(target_words * 1.05))
         final_lower = max(1, int(target_words * 0.92))
         final_upper = max(final_lower + 1, int(target_words * 1.08))
+        soft_upper = max(final_upper + 1, int(target_words * 1.15))
+        last_compress_prompt = ""
         for round_index in range(2):
             current_words = self._count_words(repaired)
             if strict_lower <= current_words <= strict_upper:
@@ -1196,6 +1274,12 @@ class ChapterWriterAgent(Agent):
                     total_sections=total_sections,
                 )
             else:
+                last_compress_prompt = self._build_word_count_compress_prompt(
+                    content=repaired,
+                    prompt=prompt,
+                    target_words=target_words,
+                    current_words=current_words,
+                )
                 next_text = self._compress_to_target_words(
                     content=repaired,
                     prompt=prompt,
@@ -1207,6 +1291,8 @@ class ChapterWriterAgent(Agent):
                     total_sections=total_sections,
                 )
             next_text = self._strip_duplicate_heading(self._sanitize_model_output(next_text, section_title), section_title)
+            if self._has_real_body_content(next_text):
+                self._record_generation_history(history, next_text)
             if not self._has_real_body_content(next_text) or next_text.strip() == repaired.strip():
                 break
             repaired = next_text.strip()
@@ -1221,6 +1307,30 @@ class ChapterWriterAgent(Agent):
                     target_words,
                 )
                 break
+
+        final_words = self._count_words(repaired)
+        if final_words > final_upper:
+            token_prompt = last_compress_prompt or self._build_word_count_compress_prompt(
+                content=repaired,
+                prompt=prompt,
+                target_words=target_words,
+                current_words=final_words,
+            )
+            capped = self.generate_with_token_cap(token_prompt, target_words, history, section_title=section_title)
+            capped = self._strip_duplicate_heading(self._sanitize_model_output(capped, section_title), section_title)
+            if self._has_real_body_content(capped):
+                self._record_generation_history(history, capped)
+                repaired = capped.strip()
+                final_words = self._count_words(repaired)
+                self._emit_content_callback(content_callback, repaired, section_title, target_words, generated_index, total_sections)
+
+        if final_words > soft_upper:
+            self.logger.warning(
+                "Word count repair still severely over limit for section %s: current=%s target=%s; marking soft fail and keeping AI generated text.",
+                section_title,
+                final_words,
+                target_words,
+            )
         return repaired
 
     def _split_sentences(self, text: str) -> List[str]:

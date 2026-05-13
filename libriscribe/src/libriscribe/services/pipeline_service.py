@@ -218,15 +218,15 @@ class PipelineService:
             actual_word_count = self._to_int(self._get(chapter, "actual_word_count", 0))
             sections = self._as_list(self._get(chapter, "sections", []))
             section_started = any(
-                self._get(section, "status", "pending") in {"writing", "completed", "reviewed"}
+                self._get(section, "status", "pending") in {"writing", "completed", "reviewed", "word_count_soft_fail"}
                 or self._to_int(self._get(section, "actual_word_count", 0)) > 0
                 for section in sections
             )
 
-            if status in {"completed", "reviewed"} or actual_word_count > 0 and status == "completed":
+            if status in {"completed", "reviewed", "word_count_soft_fail"} or actual_word_count > 0 and status in {"completed", "word_count_soft_fail"}:
                 completed += 1
                 started += 1
-            elif status in {"writing", "completed", "reviewed"} or actual_word_count > 0 or section_started:
+            elif status in {"writing", "completed", "reviewed", "word_count_soft_fail"} or actual_word_count > 0 or section_started:
                 started += 1
 
         if completed == len(chapters):

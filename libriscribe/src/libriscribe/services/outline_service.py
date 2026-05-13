@@ -47,7 +47,7 @@ class OutlineService:
             completed_sections = sum(
                 1
                 for section in leaf_sections
-                if (getattr(section, "status", "") or "").lower() in {"completed", "reviewed"}
+                if (getattr(section, "status", "") or "").lower() in {"completed", "reviewed", "word_count_soft_fail"}
             )
 
             chapter_status.append(

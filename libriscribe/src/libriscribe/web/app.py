@@ -4486,10 +4486,14 @@ def render_editor_page() -> None:
             status = getattr(sec, 'status', 'pending') or 'pending'
             actual_wc = getattr(sec, 'actual_word_count', 0)
             is_leaf = _is_leaf_section(sec.section_number)
-            status_label = {"completed": "已完成", "failed": "生成异常", "pending": "待写作"}.get(status, status)
+            status_label = {"completed": "已完成", "failed": "生成异常", "pending": "待写作", "word_count_soft_fail": "字数需复核"}.get(status, status)
             title = f"{indent}{_format_outline_section_label(sec.section_number, sec.title)}"
             meta = status_label if not actual_wc else f"{status_label} · 已生成约 {actual_wc} 字"
             with st.expander(f"{title} — {meta}"):
+                if status == "word_count_soft_fail":
+                    target_wc = getattr(sec, 'word_count_target', 0) or getattr(sec, 'word_count', 0) or 0
+                    note = getattr(sec, 'word_count_note', '') or f"目标约 {target_wc} 字，当前约 {actual_wc} 字；已自动精简，请人工复核。"
+                    st.warning(f"字数略超标，已自动精简并放行：{note}")
                 st.write(f"**{t('writing_unit_level')}:** {getattr(sec, 'level', 1)}")
                 st.write(f"**{t('writing_unit_goal')}:** {getattr(sec, 'summary', '') or sec.title or t('goal_unset')}")
                 if getattr(sec, 'rag_query', ''):
@@ -5418,18 +5422,41 @@ def _generate_manuscript_part_with_ai(
                 raise RuntimeError(getattr(client, "last_error"))
         cleaned = _sanitize_generated_manuscript_part(part_key, str(content or "").strip())
         if part_key == "references" and not _reference_entry_lines(cleaned):
-            fallback_refs = _project_existing_reference_text(project)
-            if not fallback_refs:
-                fallback_refs = _openalex_reference_fallback_text(project, requirement, options)
-            if fallback_refs:
-                cleaned = _sanitize_generated_manuscript_part(part_key, fallback_refs)
-                st.warning("AI 未返回有效参考文献条目，已改用项目真实 citation/来源记录或 OpenAlex 检索结果生成参考文献。")
-            elif _reference_entry_lines(existing_reference_text):
-                cleaned = _sanitize_generated_manuscript_part(part_key, existing_reference_text)
-                st.warning("AI 未返回有效参考文献条目，已保留编辑框中已有的有效参考文献。")
+            repaired_refs = ""
+            if cleaned.strip():
+                repair_prompt = f"""请把下面 AI 已生成的参考文献内容整理为标准参考文献列表。
+
+硬性要求：
+1. 只输出“参考文献”标题和逐条参考文献，不输出解释、说明、自评或过程。
+2. 每条单独一行，并使用 [1]、[2]、[3] 编号。
+3. 每条尽量补齐文献类型标识，如 [M]、[J]、[D]、[C]、[R]。
+4. 不新增你不确定的信息；如果原文只有不完整条目，也要保留可识别的作者、题名、年份等信息。
+
+待整理内容：
+{cleaned}
+"""
+                try:
+                    repaired_refs = client.generate_content(repair_prompt, max_tokens=1200, temperature=0.1, timeout_seconds=45, raw_attempt_limit=1)
+                except Exception:
+                    logger.exception("AI reference format repair failed")
+            if repaired_refs and _reference_entry_lines(repaired_refs):
+                cleaned = _sanitize_generated_manuscript_part(part_key, repaired_refs)
+                st.warning("AI 首次返回的参考文献格式不规范，已自动调用 AI 重新整理为参考文献列表。")
+            elif cleaned.strip():
+                st.warning("AI 已返回参考文献内容，但格式未被系统识别为标准条目；已写入正文供你在页面继续编辑，不再强制要求项目已有 citation。")
             else:
-                st.error("参考文献生成结果没有有效条目，未写入正文。当前项目没有真实 citation 记录；请先在「引用管理」粘贴参考文献，或在「资料与检索」使用 OpenAlex 导入真实引用后重试。")
-                return
+                fallback_refs = _project_existing_reference_text(project)
+                if not fallback_refs:
+                    fallback_refs = _openalex_reference_fallback_text(project, requirement, options)
+                if fallback_refs:
+                    cleaned = _sanitize_generated_manuscript_part(part_key, fallback_refs)
+                    st.warning("AI 未返回内容，已改用项目真实 citation/来源记录或 OpenAlex 检索结果生成参考文献。")
+                elif _reference_entry_lines(existing_reference_text):
+                    cleaned = _sanitize_generated_manuscript_part(part_key, existing_reference_text)
+                    st.warning("AI 未返回内容，已保留编辑框中已有的有效参考文献。")
+                else:
+                    st.error("参考文献生成失败：模型没有返回可写入内容。请稍后重试或切换模型档案。")
+                    return
         if part_key in {"preface", "conclusion"} and target_words:
             min_words = int(target_words * 0.92)
             max_words = int(target_words * 1.08)
@@ -5454,12 +5481,17 @@ def _generate_manuscript_part_with_ai(
                 actual_words = _count_manuscript_words(cleaned)
                 retry_count += 1
             if actual_words > max_words:
-                cleaned = _truncate_manuscript_part_to_max_words(cleaned, max_words)
-                actual_words = _count_manuscript_words(cleaned)
-            if actual_words < min_words:
-                st.warning(
-                    f"{MANUSCRIPT_PARTS[part_key]['title']}已生成，但当前约 {actual_words} 字，低于设定下限 {min_words} 字；已保留模型最终结果，请补充要求后重新生成。"
+                st.error(
+                    f"{MANUSCRIPT_PARTS[part_key]['title']}重写后仍明显超标：目标 {target_words} 字，允许范围 {min_words}—{max_words} 字，当前约 {actual_words} 字。"
+                    "为保证文章质量，系统不会机械裁剪正文；请减少补充要求、降低内容复杂度，或切换遵循字数更稳定的模型后重新生成。"
                 )
+                return
+            if actual_words < min_words:
+                st.error(
+                    f"{MANUSCRIPT_PARTS[part_key]['title']}重写后仍低于设定下限：目标 {target_words} 字，允许范围 {min_words}—{max_words} 字，当前约 {actual_words} 字。"
+                    "为保证文章完整性，系统不会强行拼接凑字；请补充写作要求后重新生成。"
+                )
+                return
         if not cleaned:
             st.error(f"{MANUSCRIPT_PARTS[part_key]['title']}生成结果为空，未写入正文。")
             return

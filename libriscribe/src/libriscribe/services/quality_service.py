@@ -313,7 +313,7 @@ class QualityService:
 
     @staticmethod
     def _is_completed_status(status: str) -> bool:
-        return (status or "").strip().lower() in {"completed", "reviewed"}
+        return (status or "").strip().lower() in {"completed", "reviewed", "word_count_soft_fail"}
 
     @staticmethod
     def _score_ratio(value: int, unit_count: int, target_per_unit: int) -> float:

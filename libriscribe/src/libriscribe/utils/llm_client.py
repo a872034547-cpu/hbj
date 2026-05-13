@@ -30,6 +30,9 @@ class LLMClient:
         self.custom_model = model
         self.last_error = ""
         self.last_response_preview = ""
+        self.last_usage: dict = {}
+        self.last_completion_tokens = 0
+        self.last_total_tokens = 0
         self.client = self._get_client()
         self.model = self._get_default_model()
 
@@ -107,6 +110,38 @@ class LLMClient:
             return "unknown"  # Should not happen, but good for safety
     def set_model(self, model_name: str):
       self.model = model_name
+
+    def _capture_usage(self, response) -> None:
+        """记录最近一次模型调用的 token usage，供上层字数控制做历史预估。"""
+        usage = None
+        try:
+            if isinstance(response, dict):
+                usage = response.get("usage")
+            elif hasattr(response, "usage"):
+                usage = getattr(response, "usage")
+        except Exception:
+            usage = None
+        if usage is None:
+            return
+        try:
+            if not isinstance(usage, dict):
+                if hasattr(usage, "model_dump"):
+                    usage = usage.model_dump()
+                elif hasattr(usage, "dict"):
+                    usage = usage.dict()
+                else:
+                    usage = {
+                        key: getattr(usage, key, 0)
+                        for key in ("completion_tokens", "output_tokens", "total_tokens")
+                        if hasattr(usage, key)
+                    }
+            self.last_usage = dict(usage or {})
+            completion = self.last_usage.get("completion_tokens") or self.last_usage.get("output_tokens") or 0
+            total = self.last_usage.get("total_tokens") or 0
+            self.last_completion_tokens = int(completion or 0)
+            self.last_total_tokens = int(total or 0)
+        except Exception:
+            logger.debug("Failed to capture token usage from response", exc_info=True)
 
     def _safe_response_payload(self, response):
         """将 OpenAI SDK / 第三方 SDK 对象转为可读结构，便于诊断空响应。"""
@@ -310,6 +345,9 @@ class LLMClient:
         """
         self.last_error = ""
         self.last_response_preview = ""
+        self.last_usage = {}
+        self.last_completion_tokens = 0
+        self.last_total_tokens = 0
         try:
             # Append language instruction to prompt if not already included
             if "IMPORTANT: The content should be written entirely in" not in prompt and language != "English":
@@ -322,6 +360,7 @@ class LLMClient:
                     max_tokens=max_tokens,
                     temperature=temperature,
                 )
+                self._capture_usage(response)
                 content = response.choices[0].message.content.strip()
                 # Post-process OpenRouter responses to ensure markdown JSON format
                 if self.llm_provider == "openrouter" and "```json" not in content and "{" in content:
@@ -337,6 +376,7 @@ class LLMClient:
                     temperature=temperature,
                     messages=[{"role": "user", "content": prompt}]
                 )
+                self._capture_usage(response)
                 return response.content[0].text.strip()
 
             elif self.llm_provider == "google_ai_studio":
@@ -358,7 +398,9 @@ class LLMClient:
                 endpoint = (self.custom_api_base.rstrip("/") if self.custom_api_base else "https://api.deepseek.com/v1") + "/chat/completions"
                 response = requests.post(endpoint, headers=headers, json=data, timeout=timeout_seconds or 120) # Timeout
                 response.raise_for_status() # Raise for HTTP errors
-                return response.json()["choices"][0]["message"]["content"].strip()
+                payload = response.json()
+                self._capture_usage(payload)
+                return payload["choices"][0]["message"]["content"].strip()
             elif self.llm_provider == "mistral":
                 headers = {
                     "Content-Type": "application/json",
@@ -374,7 +416,9 @@ class LLMClient:
                 endpoint = (self.custom_api_base.rstrip("/") if self.custom_api_base else "https://api.mistral.ai/v1") + "/chat/completions"
                 response = requests.post(endpoint, headers=headers, json=data, timeout=timeout_seconds or 120)
                 response.raise_for_status()
-                return response.json()['choices'][0]['message']['content'].strip()
+                payload = response.json()
+                self._capture_usage(payload)
+                return payload['choices'][0]['message']['content'].strip()
 
             elif self.llm_provider == "custom":
                 messages = [{"role": "user", "content": prompt}]
@@ -400,6 +444,7 @@ class LLMClient:
                                 messages=messages,
                                 **params,
                             )
+                            self._capture_usage(response)
                             text = self._extract_openai_compatible_text(response)
                             self.last_response_preview = (text or self._safe_response_preview(response))[:2000]
                             if text:
@@ -439,6 +484,7 @@ class LLMClient:
                             raw_payload = raw_response.json()
                         except Exception:
                             raw_payload = raw_response.text
+                        self._capture_usage(raw_payload)
                         text = self._extract_openai_compatible_text(raw_payload)
                         self.last_response_preview = (text or self._safe_response_preview(raw_payload))[:2000]
                         valid_text = self._valid_generated_text_or_empty(text, source="自定义 OpenAI-compatible 接口") if text else ""
@@ -464,6 +510,7 @@ class LLMClient:
                                 input=prompt,
                                 **params,
                             )
+                            self._capture_usage(response)
                             text = self._extract_openai_compatible_text(response)
                             self.last_response_preview = (text or self._safe_response_preview(response))[:2000]
                             valid_text = self._valid_generated_text_or_empty(text, source="自定义 OpenAI-compatible responses 接口") if text else ""

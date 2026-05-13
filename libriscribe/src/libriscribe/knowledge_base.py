@@ -44,9 +44,13 @@ class ChapterSection(BaseModel):
     word_count: int = 0  # 目标字数
     actual_word_count: int = 0  # 已生成/已写入字数
     level: int = 1  # 1=节, 2=三级标题, 3=四级标题
-    status: str = "pending"  # pending | writing | completed | reviewed
+    status: str = "pending"  # pending | writing | completed | reviewed | word_count_soft_fail
     content_path: str = ""  # 小节独立内容路径（可选）
     rag_query: str = ""  # 小节资料检索查询词（可选）
+    word_count_status: str = ""  # ok | word_count_soft_fail
+    word_count_target: int = 0  # 字数控制目标，供软失败提示使用
+    word_count_actual: int = 0  # 字数控制实际值，供软失败提示使用
+    word_count_note: str = ""  # 字数软失败说明
 
 
 class Chapter(BaseModel):
@@ -474,6 +478,10 @@ class ProjectKnowledgeBase(BaseModel):
                             sec_data["actual_word_count"] = 0
                         if "status" not in sec_data:
                             sec_data["status"] = "pending"
+                        sec_data.setdefault("word_count_status", "")
+                        sec_data.setdefault("word_count_target", int(sec_data.get("word_count", 0) or 0))
+                        sec_data.setdefault("word_count_actual", int(sec_data.get("actual_word_count", 0) or 0))
+                        sec_data.setdefault("word_count_note", "")
                         if "content_path" not in sec_data:
                             sec_data["content_path"] = ""
                         if "rag_query" not in sec_data:
