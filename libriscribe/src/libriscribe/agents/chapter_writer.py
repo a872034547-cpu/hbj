@@ -969,7 +969,7 @@ class ChapterWriterAgent(Agent):
 ---
 {{original_text}}
 ---
-
+"""
     def generate_with_token_cap(
         self,
         prompt: str,
