@@ -209,7 +209,7 @@ class ChapterWriterAgent(Agent):
         # 提前 20% 收束的硬提示
         wrap_up_threshold = int(target_words * 0.2)
         return f"""## 内部倒计时长度锚点（禁止输出）
-目标正文约 {int(target_words or 0)} 字。下面标记只用于你内部控制篇幅，禁止出现在最终正文中：
+目标正文约 {int(target_words or 0)} 字。下面标记只用于你内部控制篇幅，绝对服从用标记规则，禁止出现在最终正文中：
 {markers}
 
 使用规则：
