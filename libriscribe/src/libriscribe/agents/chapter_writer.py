@@ -8,10 +8,18 @@ from pathlib import Path
 from typing import Optional, Dict, List, Sequence, Tuple
 from libriscribe.agents.agent_base import Agent
 from libriscribe.utils import prompts_context as prompts
-from libriscribe.utils.file_utils import read_markdown_file, read_json_file, write_markdown_file, extract_json_from_markdown
+from libriscribe.utils.file_utils import (
+    read_markdown_file,
+    read_json_file,
+    write_markdown_file,
+    extract_json_from_markdown,
+)
 from libriscribe.knowledge_base import ProjectKnowledgeBase, Chapter, Scene, ChapterSection
 from libriscribe.utils.llm_client import LLMClient
-from libriscribe.utils.chinese_labels import format_chapter_label, format_outline_section_label as shared_outline_section_label
+from libriscribe.utils.chinese_labels import (
+    format_chapter_label,
+    format_outline_section_label as shared_outline_section_label,
+)
 from libriscribe.utils.academic_prompt import (
     ACADEMIC_MONOGRAPH_SYSTEM_PROMPT,
     finalize_academic_chapter,
@@ -23,15 +31,14 @@ import json
 from rich.console import Console
 
 console = Console()
-
 logger = logging.getLogger(__name__)
+
 
 class ChapterWriterAgent(Agent):
     """Writes chapters."""
 
     def __init__(self, llm_client: LLMClient):
         super().__init__("ChapterWriterAgent", llm_client)
-
 
     def execute(
         self,
@@ -42,12 +49,8 @@ class ChapterWriterAgent(Agent):
         progress_callback=None,
         content_callback=None,
         chapter_strength_prompt: str = "",
+        writing_skill_id: str = "",  # 保留但忽略
     ) -> None:
-        """撰写章节。
-
-        专著项目优先按 `Chapter.sections` 中的学术写作单元逐节生成；
-        若旧项目没有 sections，则回退到原有 scene 逻辑以保持兼容。
-        """
         try:
             chapter = project_knowledge_base.get_chapter(chapter_number)
             if not chapter:
@@ -55,11 +58,11 @@ class ChapterWriterAgent(Agent):
                 chapter = Chapter(
                     chapter_number=chapter_number,
                     title=f"Chapter {chapter_number}",
-                    summary="A new academic chapter."
+                    summary="A new academic chapter.",
                 )
                 project_knowledge_base.add_chapter(chapter)
 
-            console.print("\n[cyan]Writing Chapter %d: %s[/cyan]" % (chapter_number, chapter.title or ""))
+            console.print(f"\n[cyan]Writing Chapter {chapter_number}: {chapter.title or ''}[/cyan]")
 
             if output_path is None:
                 proj_dir = project_knowledge_base.project_dir
@@ -78,38 +81,55 @@ class ChapterWriterAgent(Agent):
                     chapter_strength_prompt=chapter_strength_prompt,
                 )
             else:
-                chapter_content = self._write_legacy_scene_chapter(project_knowledge_base, chapter_number, chapter)
+                chapter_content = self._write_legacy_scene_chapter(
+                    project_knowledge_base, chapter_number, chapter
+                )
 
             if not self._has_real_body_content(chapter_content):
-                raise RuntimeError("模型没有返回可写入正文的有效内容，请检查模型配置、API Base 或网络状态。")
+                raise RuntimeError(
+                    "模型没有返回可写入正文的有效内容，请检查模型配置、API Base 或网络状态。"
+                )
 
             write_markdown_file(output_path, chapter_content)
             chapter.actual_word_count = self._count_words(chapter_content)
             chapter.status = "completed"
             project_knowledge_base.chapters[chapter_number] = chapter
-            console.print("[green]Chapter %d completed.[/green]" % chapter_number)
+            console.print(f"[green]Chapter {chapter_number} completed.[/green]")
 
         except Exception as e:
             self.logger.exception(f"Error writing chapter {chapter_number}: {e}")
-            console.print(f"[red]ERROR: Failed to write chapter {chapter_number}. See log for details.[/red]")
+            console.print(
+                f"[red]ERROR: Failed to write chapter {chapter_number}. See log for details.[/red]"
+            )
             raise
 
     @staticmethod
     def format_outline_section_label(section_number: str, title: str = "") -> str:
-        """把内部 1.1/1.1.1/1.1.1.1 编号统一转换为中文大纲标题。"""
         return shared_outline_section_label(section_number, title)
 
     @staticmethod
     def section_heading_pattern(section_number: str, section_title: str = "") -> re.Pattern:
-        """匹配同一写作单元的新旧 Markdown 标题，兼容旧数字标题和新中文标题。"""
-        display_title = ChapterWriterAgent.format_outline_section_label(section_number, section_title)
+        display_title = ChapterWriterAgent.format_outline_section_label(
+            section_number, section_title
+        )
         legacy_title = f"{section_number} {section_title}".strip()
-        alternatives = {re.escape(section_number), re.escape(legacy_title), re.escape(display_title)}
-        return re.compile(r"^(#{2,6})\s+(?:" + "|".join(sorted(alternatives, key=len, reverse=True)) + r")(?:\s|$)")
+        alternatives = {
+            re.escape(section_number),
+            re.escape(legacy_title),
+            re.escape(display_title),
+        }
+        return re.compile(
+            r"^(#{2,6})\s+(?:"
+            + "|".join(sorted(alternatives, key=len, reverse=True))
+            + r")(?:\s|$)"
+        )
+
+    @staticmethod
+    def _word_count_delta_score(words: int, target_words: int) -> int:
+        return abs(int(words or 0) - int(target_words or 0))
 
     @staticmethod
     def distribute_word_targets(section_titles: Sequence[str], total_words: int) -> List[int]:
-        """按标题语义节奏分配目标字数，避免各小节机械平均。"""
         titles = [str(title or "") for title in section_titles]
         if not titles:
             return []
@@ -124,7 +144,21 @@ class ChapterWriterAgent(Agent):
             (("类型", "分类", "构成", "要素", "框架"), 1.05),
             (("问题", "困境", "矛盾", "风险", "挑战", "瓶颈", "原因"), 1.28),
             (("机制", "逻辑", "关系", "影响", "作用", "机理"), 1.38),
-            (("路径", "策略", "优化", "模型", "实践", "治理", "建设", "应用", "方案", "转化"), 1.48),
+            (
+                (
+                    "路径",
+                    "策略",
+                    "优化",
+                    "模型",
+                    "实践",
+                    "治理",
+                    "建设",
+                    "应用",
+                    "方案",
+                    "转化",
+                ),
+                1.48,
+            ),
         ]
         coefficients: List[float] = []
         for title in titles:
@@ -136,11 +170,13 @@ class ChapterWriterAgent(Agent):
             coefficients.append(coefficient)
 
         coefficient_sum = sum(coefficients) or float(len(titles))
-        raw_targets = [total * coefficient / coefficient_sum for coefficient in coefficients]
-        targets = [max(1, int(round(value))) for value in raw_targets]
+        raw_targets = [total * c / coefficient_sum for c in coefficients]
+        targets = [max(1, int(round(v))) for v in raw_targets]
         delta = total - sum(targets)
         if delta:
-            order = sorted(range(len(targets)), key=lambda idx: coefficients[idx], reverse=delta > 0)
+            order = sorted(
+                range(len(targets)), key=lambda idx: coefficients[idx], reverse=delta > 0
+            )
             step = 1 if delta > 0 else -1
             for idx in order:
                 if delta == 0:
@@ -151,240 +187,87 @@ class ChapterWriterAgent(Agent):
                 delta -= step
         return targets
 
-    def _write_academic_chapter(
-        self,
-        project_knowledge_base: ProjectKnowledgeBase,
-        chapter_number: int,
-        chapter: Chapter,
-        section_number: Optional[str] = None,
-        progress_callback=None,
-        content_callback=None,
-        chapter_strength_prompt: str = "",
+    # ---------- 倒计时标记（内置篇幅尺） ----------
+    def _build_countdown_markers(self, target_words: int, chunk_size: int = 100) -> str:
+        target = max(1, int(target_words or 0))
+        chunk = max(25, int(chunk_size or 100))
+        values = list(range(target, 0, -chunk))
+        values.append(0)
+        return " ".join(f"[{value}/{target}]" for value in values)
+
+    def _countdown_marker_prompt(
+        self, target_words: int, chunk_size: int = 100, mode: str = "draft"
     ) -> str:
-        """按四级目录写作单元生成学术专著章节；传入 section_number 时仅生成指定小节。
-
-        有子节的小节（如 1.1 有 1.1.1/1.1.2 子节）只输出标题作为结构标记，
-        不单独生成内容；只有叶子节点（最深层无子节的小节）才调用 AI 生成正文。
-        """
-        all_sections = sorted(chapter.sections, key=lambda s: [int(p) if p.isdigit() else 0 for p in s.section_number.split('.')])
-
-        # 判断哪些小节是叶子节点（没有子节的最深层小节）
-        section_numbers = {sec.section_number for sec in all_sections}
-        def _is_leaf(sec):
-            """检查小节是否为叶子节点：没有其他小节的编号以它为前缀。"""
-            sn = sec.section_number
-            for other_sn in section_numbers:
-                if other_sn != sn and other_sn.startswith(sn + "."):
-                    return False
-            return True
-
-        leaf_sections = [sec for sec in all_sections if _is_leaf(sec)]
-
-        # 指定小节生成时：只允许叶子节点
-        if section_number:
-            ordered_sections = [sec for sec in all_sections if sec.section_number == section_number]
-            if not ordered_sections:
-                raise ValueError(f"Section {section_number} not found in chapter {chapter_number}.")
-            # 如果指定的是非叶子节点，自动改为生成其所有叶子子节
-            if not _is_leaf(ordered_sections[0]):
-                target_prefix = section_number + "."
-                ordered_sections = [sec for sec in leaf_sections if sec.section_number.startswith(target_prefix)]
-                if not ordered_sections:
-                    # 没有叶子子节，只输出标题
-                    ordered_sections = []
+        markers = self._build_countdown_markers(target_words, chunk_size=chunk_size)
+        if mode == "compress":
+            task = "请按目标字数重写完整正文，优先删除重复解释、空泛过渡、套话和跑题内容。"
+        elif mode == "expand":
+            task = "请按目标字数重写完整正文，把补充内容融合进原有论证结构，不要简单追加尾巴。"
         else:
-            # 全章生成：只生成叶子节点，非叶子节点只输出标题
-            ordered_sections = leaf_sections
+            task = "请按目标字数撰写当前小节正文，围绕写作思路充分展开。"
 
-        terminology = project_knowledge_base.get_terminology_context()
-        previous_summaries = project_knowledge_base.get_previous_summaries(chapter_number)
-        outline_tree = "\n".join(
-            f"{'  ' * (max(getattr(sec, 'level', 1) - 1, 0))}- {self.format_outline_section_label(sec.section_number, sec.title)}"
-            for sec in all_sections
-        )
+        # 提前 20% 收束的硬提示
+        wrap_up_threshold = int(target_words * 0.2)
+        return f"""## 内部倒计时长度锚点（禁止输出）
+目标正文约 {int(target_words or 0)} 字。下面标记只用于你内部控制篇幅，禁止出现在最终正文中：
+{markers}
 
-        # 只把章标题写入正文。章摘要、大纲树和“写作思路”只作为模型写作计划上下文，
-        # 不再以“本章导语”等形式直接拼进正文，避免预览/导出泄漏规划文本。
-        content_parts = [f"# {format_chapter_label(chapter_number, chapter.title)}".strip(), ""]
-        generated_summaries = []
-        target_numbers = {sec.section_number for sec in ordered_sections}
-        target_total_words = (
-            int(getattr(chapter, "word_count", 0) or 0)
-            or sum(int(getattr(sec, "word_count", 0) or 0) for sec in ordered_sections)
-            or max(800 * max(len(ordered_sections), 1), 4000)
-        )
-        rhythm_targets = self.distribute_word_targets(
-            [self.format_outline_section_label(sec.section_number, sec.title) for sec in ordered_sections],
-            target_total_words,
-        )
-        rhythm_target_by_number = {sec.section_number: rhythm_targets[idx] for idx, sec in enumerate(ordered_sections) if idx < len(rhythm_targets)}
-        generated_index = 0
+使用规则：
+1. 每推进一个标记，约完成 {chunk_size} 个中文字符的有效正文。
+2. 标记不是标题、编号、脚注或正文内容，最终输出中不得出现任何类似 [800/800]、[700/800] 的标记。
+3. {task}
+4. 不得为了消耗标记灌水，不得编造新事实、新数据、新文献。
+5. 当标记推进到剩余约 {wrap_up_threshold} 字（即出现 [{wrap_up_threshold}/{target_words}] 附近标记）时，表示已接近字数上限，必须立即转向总结收束，只写核心判断或结论，不再新增任何分论点或展开分析。
+6. 接近最后两个标记时自然收束，确保正文在标记归零前完整结束。
+"""
 
-        # 按目录顺序输出：结构标题 -> 其下叶子小节正文，避免把 1.1/1.2/1.3 标题集中堆在前面。
-        for section in all_sections:
-            level = max(1, min(getattr(section, "level", 1), 3))
-            markdown_level = "#" * (level + 1)
-            section_title = self.format_outline_section_label(section.section_number, section.title)
+    def _strip_countdown_markers(self, text: str) -> str:
+        return re.sub(r"\[\s*\d+\s*/\s*\d+\s*\]", "", str(text or "")).strip()
 
-            if not _is_leaf(section):
-                if not section_number or section.section_number == section_number or section.section_number.startswith((section_number or "") + ".") or (section_number and section_number.startswith(section.section_number + ".")):
-                    content_parts.append(f"{markdown_level} {section_title}\n")
-                continue
+    # ---------- Token 预估与历史 ----------
+    def _estimate_token_cap(
+        self, target_words: int, history: List[Tuple[int, int]], safety_factor: float = 0.9
+    ) -> int:
+        ratios = [cw / tk for tk, cw in history if tk > 0 and cw > 0]
+        avg_ratio = sum(ratios) / len(ratios) if ratios else 0.6
+        avg_ratio = max(0.3, min(avg_ratio, 1.2))
+        estimated = int((max(1, target_words) / avg_ratio) * safety_factor)
+        return max(300, min(6000, estimated))
 
-            if section.section_number not in target_numbers:
-                continue
+    def _estimate_output_tokens(self, text: str) -> int:
+        value = str(text or "")
+        if not value:
+            return 0
+        try:
+            import tiktoken
 
-            generated_index += 1
-            target_words = rhythm_target_by_number.get(section.section_number) or getattr(section, "word_count", 0) or max(800, int((getattr(chapter, "word_count", 0) or 4000) / max(len(ordered_sections), 1)))
-            console.print("[cyan]Writing academic section %d/%d: %s[/cyan]" % (generated_index, len(ordered_sections), section_title))
+            encoding = tiktoken.get_encoding("cl100k_base")
+            return len(encoding.encode(value))
+        except Exception:
+            chinese = self._count_words(value)
+            ascii_chars = len(re.findall(r"[A-Za-z0-9]", value))
+            other_chars = max(0, len(value) - chinese - ascii_chars)
+            return max(1, int(chinese / 0.6) + int(ascii_chars / 4) + int(other_chars / 2))
 
-            rag_context = self._get_rag_context(
-                getattr(section, 'rag_query', '') or section.title or section_title,
-                project=project_knowledge_base,
-            )
-            prompt = self._build_academic_section_prompt(
-                project=project_knowledge_base,
-                chapter=chapter,
-                chapter_number=chapter_number,
-                section=section,
-                section_title=section_title,
-                target_words=target_words,
-                outline_tree=outline_tree,
-                terminology=terminology,
-                previous_summaries=previous_summaries,
-                rag_context=rag_context,
-                generated_summaries="\n".join(generated_summaries[-3:]),
-                chapter_strength_prompt=chapter_strength_prompt,
-            )
-            if progress_callback:
-                progress_callback(generated_index, len(ordered_sections), section_title, "start")
+    def _last_completion_token_count(self, text: str) -> int:
+        completion_tokens = int(getattr(self.llm_client, "last_completion_tokens", 0) or 0)
+        total_tokens = int(getattr(self.llm_client, "last_total_tokens", 0) or 0)
+        if completion_tokens > 0:
+            return completion_tokens
+        if total_tokens > 0:
+            return total_tokens
+        return self._estimate_output_tokens(text)
 
-            # 初稿阶段不再把精确字数压力交给模型；这里只给足生成预算。
-            # 具体字数由后续系统统计、裁判和最多两轮补写/压缩修正完成。
-            max_tokens = max(1800, min(16000, int(target_words * 3.0)))
-            section_content = self._generate_section_with_retries(
-                prompt=prompt,
-                section_title=section_title,
-                target_words=target_words,
-                max_tokens=max_tokens,
-                content_callback=content_callback,
-                progress_callback=progress_callback,
-                generated_index=generated_index,
-                total_sections=len(ordered_sections),
-            )
+    def _record_generation_history(self, history: List[Tuple[int, int]], text: str) -> None:
+        words = self._count_words(text)
+        tokens = self._last_completion_token_count(text)
+        if tokens > 0 and words > 0:
+            history.append((tokens, words))
 
-            section_content = self._strip_duplicate_heading(self._sanitize_model_output(section_content, section_title), section_title)
-            if not section_content:
-                section.actual_word_count = 0
-                section.status = "failed"
-                if progress_callback:
-                    progress_callback(generated_index, len(ordered_sections), section_title, "failed_final")
-                raise RuntimeError(
-                    f"小节 {section_title} 连续重试后仍未获得有效正文。"
-                    "请检查当前模型是否拦截长提示、是否支持较大 max_tokens，或降低该小节目标字数后重试。"
-                )
+    def _word_count_pressure_text(self, pressure_level: int, mode: str) -> str:
+        return "按系统统计结果修正正文篇幅，禁止把修订过程写进正文。"
 
-            section_content = self.check_and_rewrite_quotes(
-                section_content,
-                section_title=section_title,
-                target_words=target_words,
-                content_callback=content_callback,
-                generated_index=generated_index,
-                total_sections=len(ordered_sections),
-            )
-            section_content = self.check_and_rewrite_language_norms(
-                section_content,
-                section_title=section_title,
-                target_words=target_words,
-                content_callback=content_callback,
-                generated_index=generated_index,
-                total_sections=len(ordered_sections),
-            )
-            section_content = self._quality_gate_section_content(
-                project=project_knowledge_base,
-                prompt=prompt,
-                section_title=section_title,
-                content=section_content,
-                target_words=target_words,
-                content_callback=content_callback,
-                generated_index=generated_index,
-                total_sections=len(ordered_sections),
-            )
-            section_content = self.check_and_rewrite_quotes(
-                section_content,
-                section_title=section_title,
-                target_words=target_words,
-                content_callback=content_callback,
-                generated_index=generated_index,
-                total_sections=len(ordered_sections),
-            )
-            section_content = self.check_and_rewrite_language_norms(
-                section_content,
-                section_title=section_title,
-                target_words=target_words,
-                content_callback=content_callback,
-                generated_index=generated_index,
-                total_sections=len(ordered_sections),
-            )
-            section_content = self._complete_truncated_tail(
-                content=section_content,
-                prompt=prompt,
-                section_title=section_title,
-                target_words=target_words,
-                content_callback=content_callback,
-                generated_index=generated_index,
-                total_sections=len(ordered_sections),
-            )
-            section_content = self._repair_word_count_loop(
-                content=section_content,
-                prompt=prompt,
-                section_title=section_title,
-                target_words=target_words,
-                content_callback=content_callback,
-                generated_index=generated_index,
-                total_sections=len(ordered_sections),
-            )
-            section_content = self._finalize_section_content(section_content, section_title, target_words)
-            actual_words = self._count_words(section_content)
-            section.actual_word_count = actual_words
-            section.word_count_target = int(target_words or 0)
-            section.word_count_actual = actual_words
-            if target_words and actual_words > int(target_words * 1.15):
-                section.status = "word_count_soft_fail"
-                section.word_count_status = "word_count_soft_fail"
-                section.word_count_note = (
-                    f"目标 {target_words} 字，当前约 {actual_words} 字；已经过两轮 AI 协商压缩和一次 token 上限压缩，"
-                    "为保证文章质量未做代码裁剪，正文已放行并建议人工复核。"
-                )
-                self.logger.warning("Section %s marked word_count_soft_fail: target=%s actual=%s", section_title, target_words, actual_words)
-            else:
-                section.status = "completed"
-                section.word_count_status = "ok"
-                section.word_count_note = ""
-            generated_summaries.append(f"{section_title}: {section_content[:240]}")
-            content_parts.append(f"{markdown_level} {section_title}\n\n{section_content.strip()}\n")
-            if content_callback:
-                content_callback(section_content, section_title, generated_index, len(ordered_sections))
-            if progress_callback:
-                progress_callback(generated_index, len(ordered_sections), section_title, "completed")
-
-        if not section_number:
-            chapter.sections = all_sections
-            content_parts.extend(["", self._build_chapter_back_matter(project_knowledge_base, chapter, chapter_number, content_parts, terminology)])
-        else:
-            updated = {sec.section_number: sec for sec in ordered_sections}
-            chapter.sections = [updated.get(sec.section_number, sec) for sec in all_sections]
-        chapter_text = "\n".join(content_parts).strip() + "\n"
-        if not section_number:
-            target_words = getattr(chapter, "word_count", 0) or sum(getattr(sec, "word_count", 0) or 0 for sec in getattr(chapter, "sections", []))
-            chapter_text, score_total, verdict = finalize_academic_chapter(chapter_text, target_words=target_words)
-            if score_total < 40:
-                self.logger.warning("Chapter %s self-assessment below 80 (%s/50): %s. Applying deterministic formatting rewrite once.", chapter_number, score_total, verdict)
-                chapter_text, _, _ = finalize_academic_chapter(ensure_fullwidth_indent(chapter_text), target_words=target_words)
-        else:
-            chapter_text = ensure_fullwidth_indent(chapter_text)
-        return chapter_text
-
+    # ---------- 提示词构建 ----------
     def _build_academic_section_prompt(
         self,
         project: ProjectKnowledgeBase,
@@ -403,8 +286,8 @@ class ChapterWriterAgent(Agent):
         from libriscribe.services.prompt_service import PromptService
 
         template = PromptService.load_chapter_prompt()
-        section_level = getattr(section, 'level', 1)
-        section_goal = getattr(section, 'summary', '') or section_title
+        section_level = getattr(section, "level", 1)
+        section_goal = getattr(section, "summary", "") or section_title
         paragraph_rule = (
             "分段必须服从语义转折，而不是服从字数平均；只有当论证从概念界定转入机制分析、"
             "从问题诊断转入路径讨论、从一般判断转入边界/风险时才分段。每个自然段至少包含5个完整句子；"
@@ -420,13 +303,20 @@ class ChapterWriterAgent(Agent):
                 f"{strength_prompt}"
             )
         )
+        countdown_prompt = (
+            self._countdown_marker_prompt(target_words, chunk_size=100, mode="draft")
+            if target_words
+            else ""
+        )
         section_details = (
             f"小节标题：{section_title}\n"
             f"目录层级：{section_level}\n"
             f"写作思路（最高优先级，只围绕它写，不自行扩展新分论点）：{section_goal}\n"
             f"本章强化提示词：{strength_rule}\n"
             f"篇幅行为：正文应围绕写作思路充分展开，避免明显短促或重复灌水；具体字数由系统代码统计和修正，AI 不得自行计数、说明或自评字数。\n"
-            f"段落行为：{paragraph_rule}"
+            f"段落行为：{paragraph_rule}\n"
+            f"内部长度控制：{countdown_prompt}\n"
+            f"已选择写作 Skill：未选择；不得加载或套用任何 Skill 专属设置。"
         )
         values = {
             "book_title": project.title,
@@ -444,10 +334,10 @@ class ChapterWriterAgent(Agent):
             "section_details": section_details,
             "target_words": target_words,
             "outline_tree": outline_tree,
-            "previous_summaries": previous_summaries or '暂无',
-            "generated_summaries": generated_summaries or '暂无',
-            "terminology_context": terminology or '暂无',
-            "rag_context": rag_context or '暂无可用参考资料。若无资料，请基于通用学术知识谨慎写作，不编造具体数据来源。',
+            "previous_summaries": previous_summaries or "暂无",
+            "generated_summaries": generated_summaries or "暂无",
+            "terminology_context": terminology or "暂无",
+            "rag_context": rag_context or "暂无可用参考资料。若无资料，请基于通用学术知识谨慎写作，不编造具体数据来源。",
         }
         chapter_strength_rules = f"""## 本章强化提示词（用户自定义，单章生成前填写）
 {strength_rule}
@@ -490,24 +380,39 @@ class ChapterWriterAgent(Agent):
             user_prompt = template.format(**values)
         except KeyError as exc:
             missing = exc.args[0]
-            raise ValueError(f"全局章节提示词缺少或写错变量：{{{missing}}}。请从左上角“好编辑”隐藏入口进入全局设置，恢复默认或修正提示词变量。") from exc
+            raise ValueError(
+                f"全局章节提示词缺少或写错变量：{{{missing}}}。请从左上角“好编辑”隐藏入口进入全局设置，恢复默认或修正提示词变量。"
+            ) from exc
         return f"{ACADEMIC_MONOGRAPH_SYSTEM_PROMPT}\n\n{chapter_strength_rules}\n\n{evidence_rules}\n\n{user_prompt}"
 
-    def _build_chapter_intro(self, project: ProjectKnowledgeBase, chapter: Chapter, chapter_number: int, outline_tree: str) -> str:
-        """生成稳定的章首导语，避免额外 LLM 调用导致无反馈或污染正文。"""
+    def _build_chapter_intro(
+        self,
+        project: ProjectKnowledgeBase,
+        chapter: Chapter,
+        chapter_number: int,
+        outline_tree: str,
+    ) -> str:
         summary = (chapter.summary or "").strip()
         if summary:
             base = summary
         else:
-            base = f"本章围绕{chapter.title}展开，依据章节目录依次讨论相关概念、技术脉络、应用场景与实践问题。"
+            base = (
+                f"本章围绕{chapter.title}展开，依据章节目录依次讨论相关概念、技术脉络、应用场景与实践问题。"
+            )
         return (
-            f"本章导语：{base} 本章按照{format_chapter_label(chapter_number)}的目录结构展开论述，先界定核心概念与问题边界，"
-            "再结合相关研究资料、行业实践和技术演进进行分析。"
+            f"本章导语：{base} 本章按照{format_chapter_label(chapter_number)}的目录结构展开论述，"
+            "先界定核心概念与问题边界，再结合相关研究资料、行业实践和技术演进进行分析。"
             "全文保持中立、客观、可出版的学术专著表达方式，避免主观化和口语化表述。"
         )
 
-    def _build_chapter_back_matter(self, project: ProjectKnowledgeBase, chapter: Chapter, chapter_number: int, content_parts: List[str], terminology: str) -> str:
-        """生成章末结构：普通章仅本章小结；末章追加全书参考文献与术语表附录。"""
+    def _build_chapter_back_matter(
+        self,
+        project: ProjectKnowledgeBase,
+        chapter: Chapter,
+        chapter_number: int,
+        content_parts: List[str],
+        terminology: str,
+    ) -> str:
         summary_block = (
             "## 本章小结\n\n"
             f"本章围绕{chapter.title}展开系统论述，按照既定目录完成了核心概念、关键问题、技术路径和应用价值的分析。"
@@ -518,21 +423,32 @@ class ChapterWriterAgent(Agent):
             return summary_block
 
         refs = self._build_reference_list(project, chapter, include_all=True)
-        reference_block = "## 全书参考文献\n\n" + ("\n".join(refs) if refs else "（全书暂无参考文献）")
-        terms = self._extract_terms_for_glossary(chapter, terminology, project=project, include_all=True)
+        reference_block = "## 全书参考文献\n\n" + (
+            "\n".join(refs) if refs else "（全书暂无参考文献）"
+        )
+        terms = self._extract_terms_for_glossary(
+            chapter, terminology, project=project, include_all=True
+        )
         glossary_lines = [f"- **{term}**：{definition}" for term, definition in terms]
-        glossary_block = "## 附录A 术语表\n\n" + ("\n".join(glossary_lines) if glossary_lines else "（全书暂无术语表）")
+        glossary_block = "## 附录A 术语表\n\n" + (
+            "\n".join(glossary_lines) if glossary_lines else "（全书暂无术语表）"
+        )
         return summary_block + "\n\n" + reference_block + "\n\n" + glossary_block
 
     def _is_final_chapter(self, project: ProjectKnowledgeBase, chapter_number: int) -> bool:
-        """根据当前项目实际章节号判定末章，允许用户后续调整总章数。"""
         try:
             chapter_numbers = [int(num) for num in project.chapters.keys()]
         except Exception:
             chapter_numbers = []
         return bool(chapter_numbers) and int(chapter_number) == max(chapter_numbers)
 
-    def _extract_terms_for_glossary(self, chapter: Chapter, terminology: str, project: Optional[ProjectKnowledgeBase] = None, include_all: bool = False) -> List[tuple[str, str]]:
+    def _extract_terms_for_glossary(
+        self,
+        chapter: Chapter,
+        terminology: str,
+        project: Optional[ProjectKnowledgeBase] = None,
+        include_all: bool = False,
+    ) -> List[tuple[str, str]]:
         term_map: Dict[str, str] = {}
         if project and include_all:
             for term, definition in getattr(project, "terminology", {}).items():
@@ -562,21 +478,35 @@ class ChapterWriterAgent(Agent):
                     term_map[title] = "本书目录中的关键议题或分析对象，用于保持全书概念和标题表述一致。"
         return list(term_map.items())[:30]
 
-    def _build_reference_list(self, project: ProjectKnowledgeBase, chapter: Chapter, include_all: bool = False) -> List[str]:
-        """只使用项目中真实存在的 citation 记录，禁止用模板伪造参考文献。"""
+    def _build_reference_list(
+        self,
+        project: ProjectKnowledgeBase,
+        chapter: Chapter,
+        include_all: bool = False,
+    ) -> List[str]:
         refs = []
         try:
-            citations = list(getattr(project, "citations", []) or []) if include_all else project.get_citations_for_chapter(getattr(chapter, "chapter_number", 0) or 0)
+            citations = (
+                list(getattr(project, "citations", []) or [])
+                if include_all
+                else project.get_citations_for_chapter(
+                    getattr(chapter, "chapter_number", 0) or 0
+                )
+            )
         except Exception:
             citations = []
         seen = set()
-        for idx, citation in enumerate(citations, start=1):
+        for citation in citations:
             formatted = (getattr(citation, "formatted_ref", "") or "").strip()
             if formatted:
                 ref_text = formatted
             else:
                 source = (getattr(citation, "source", "") or "").strip()
-                quote = (getattr(citation, "quote_original", "") or getattr(citation, "sentence", "") or "").strip()
+                quote = (
+                    getattr(citation, "quote_original", "")
+                    or getattr(citation, "sentence", "")
+                    or ""
+                ).strip()
                 if not source and not quote:
                     continue
                 ref_text = f"{source or '来源待核验'}：{quote or '原文摘录待核验'}"
@@ -586,24 +516,25 @@ class ChapterWriterAgent(Agent):
             refs.append(f"- [{len(refs) + 1}] {ref_text}")
         return refs
 
-    def _get_rag_context(self, query: str, project: Optional[ProjectKnowledgeBase] = None) -> str:
-        """获取章节写作参考资料。
-
-        优先使用向量检索；如果 embedding/Chroma 不可用或无结果，则回退到项目资料库证据片段，
-        确保用户上传的普通资料、文案、报告仍会进入章节提示词。
-        """
+    def _get_rag_context(
+        self, query: str, project: Optional[ProjectKnowledgeBase] = None
+    ) -> str:
         vector_context = ""
         try:
             import importlib.util
+
             if importlib.util.find_spec("chromadb") is None:
                 self.logger.info("RAG retrieval skipped: chromadb is not installed.")
             else:
                 from libriscribe.rag.retriever import Retriever
+
                 vector_context = Retriever().get_context_for_prompt(query, top_k=4)
         except Exception as e:
             self.logger.warning("RAG retrieval skipped: %s", e)
 
-        library_context = self._get_project_material_context(project, query=query, limit=5000, max_chunks=8)
+        library_context = self._get_project_material_context(
+            project, query=query, limit=5000, max_chunks=8
+        )
         if vector_context and library_context:
             return f"{vector_context}\n\n## 资料库兜底片段\n{library_context}"
         return vector_context or library_context
@@ -615,7 +546,6 @@ class ChapterWriterAgent(Agent):
         limit: int = 5000,
         max_chunks: int = 8,
     ) -> str:
-        """从 ProjectKnowledgeBase 中直接抽取资料库片段，作为无向量索引时的写作兜底。"""
         if project is None:
             return ""
         documents_by_id = {
@@ -623,7 +553,11 @@ class ChapterWriterAgent(Agent):
             for doc in (getattr(project, "source_documents", []) or [])
             if str(getattr(doc, "id", "")).strip()
         }
-        query_terms = [term for term in re.split(r"[\s，,。；;：:、（）()]+", str(query or "")) if len(term) >= 2]
+        query_terms = [
+            term
+            for term in re.split(r"[\s，,。；;：:、（）()]+", str(query or ""))
+            if len(term) >= 2
+        ]
         scored_chunks = []
         for chunk in getattr(project, "evidence_chunks", []) or []:
             text = str(getattr(chunk, "text", "") or "").strip()
@@ -654,6 +588,7 @@ class ChapterWriterAgent(Agent):
             )
         return "\n\n".join(parts).strip()[:limit]
 
+    # ---------- 生成与重试 ----------
     def _generate_section_with_retries(
         self,
         prompt: str,
@@ -665,21 +600,32 @@ class ChapterWriterAgent(Agent):
         generated_index: int = 1,
         total_sections: int = 1,
     ) -> str:
-        """小节生成的商用级容错入口：优先走稳定非流式，失败后缩短提示和 token 继续重试。"""
         attempts = []
         provider = getattr(self.llm_client, "llm_provider", "")
-
-        # 自定义 OpenAI 兼容平台常被 SDK stream 请求头拦截；直接使用 generate_content，复用 raw HTTP 兜底。
         if provider != "custom" and hasattr(self.llm_client, "stream_content"):
             attempts.append(("stream", prompt, max_tokens, 0.65, "正在流式生成"))
         attempts.extend([
             ("generate", prompt, max_tokens, 0.60, "流式受阻，正在非流式重试"),
-            ("generate", prompt, max(1800, min(max_tokens, 12000)), 0.45, "正在稳定 token 重试"),
-            ("generate", self._build_compact_retry_prompt(prompt, section_title, target_words), max(1800, min(max_tokens, 10000)), 0.35, "正在使用精简提示重试"),
+            (
+                "generate",
+                prompt,
+                max(1800, min(max_tokens, 12000)),
+                0.45,
+                "正在稳定 token 重试",
+            ),
+            (
+                "generate",
+                self._build_compact_retry_prompt(prompt, section_title, target_words),
+                max(1800, min(max_tokens, 10000)),
+                0.35,
+                "正在使用精简提示重试",
+            ),
         ])
 
         last_error = ""
-        for attempt_index, (mode, attempt_prompt, attempt_tokens, temperature, label) in enumerate(attempts, start=1):
+        for attempt_index, (mode, attempt_prompt, attempt_tokens, temperature, label) in enumerate(
+            attempts, start=1
+        ):
             if progress_callback and attempt_index > 1:
                 progress_callback(generated_index, total_sections, section_title, "retrying")
             self.logger.info(
@@ -692,11 +638,18 @@ class ChapterWriterAgent(Agent):
             )
             try:
                 if content_callback and attempt_index > 1:
-                    content_callback(f"_{label}（第 {attempt_index}/{len(attempts)} 次）..._", section_title, generated_index, total_sections)
+                    content_callback(
+                        f"_{label}（第 {attempt_index}/{len(attempts)} 次）..._",
+                        section_title,
+                        generated_index,
+                        total_sections,
+                    )
 
                 if mode == "stream":
                     chunks = []
-                    for chunk in self.llm_client.stream_content(attempt_prompt, max_tokens=attempt_tokens, temperature=temperature):
+                    for chunk in self.llm_client.stream_content(
+                        attempt_prompt, max_tokens=attempt_tokens, temperature=temperature
+                    ):
                         if not chunk:
                             continue
                         chunks.append(str(chunk))
@@ -710,7 +663,9 @@ class ChapterWriterAgent(Agent):
                         )
                     content = "".join(chunks)
                 else:
-                    content = self.llm_client.generate_content(attempt_prompt, max_tokens=attempt_tokens, temperature=temperature)
+                    content = self.llm_client.generate_content(
+                        attempt_prompt, max_tokens=attempt_tokens, temperature=temperature
+                    )
                     if content:
                         self._emit_content_callback(
                             content_callback,
@@ -721,14 +676,20 @@ class ChapterWriterAgent(Agent):
                             total_sections,
                         )
 
-                content = self._strip_duplicate_heading(self._sanitize_model_output(content, section_title), section_title)
+                content = self._strip_duplicate_heading(
+                    self._sanitize_model_output(content, section_title), section_title
+                )
                 if self._has_real_body_content(content):
                     return content
                 last_error = "模型返回为空或正文质量不足"
-                self.logger.warning("Section %s attempt %s returned no valid body.", section_title, attempt_index)
+                self.logger.warning(
+                    "Section %s attempt %s returned no valid body.", section_title, attempt_index
+                )
             except Exception as e:
                 last_error = str(e)
-                self.logger.warning("Section %s attempt %s failed: %s", section_title, attempt_index, e)
+                self.logger.warning(
+                    "Section %s attempt %s failed: %s", section_title, attempt_index, e
+                )
 
         diagnostics = []
         if last_error:
@@ -739,11 +700,14 @@ class ChapterWriterAgent(Agent):
         preview = getattr(self.llm_client, "last_response_preview", "")
         if preview:
             diagnostics.append(f"响应预览：{preview[:300]}")
-        self.logger.error("Section %s exhausted retries. %s", section_title, " | ".join(diagnostics))
+        self.logger.error(
+            "Section %s exhausted retries. %s", section_title, " | ".join(diagnostics)
+        )
         return ""
 
-    def _build_compact_retry_prompt(self, original_prompt: str, section_title: str, target_words: int) -> str:
-        """构造短提示，规避部分模型/中转站对超长提示或高 token 的拦截。"""
+    def _build_compact_retry_prompt(
+        self, original_prompt: str, section_title: str, target_words: int
+    ) -> str:
         compact_context = original_prompt[:3500]
         return f"""{ACADEMIC_MONOGRAPH_SYSTEM_PROMPT}
 
@@ -763,6 +727,7 @@ class ChapterWriterAgent(Agent):
 8. 如果资料不足，用“【信息缺失】需要您提供……”说明缺口，但仍需完成基于通用知识的审慎论述。
 """
 
+    # ---------- 质量门禁（已移除 WritingSkill，但保留基础架构） ----------
     def _quality_gate_section_content(
         self,
         project: ProjectKnowledgeBase,
@@ -774,58 +739,11 @@ class ChapterWriterAgent(Agent):
         generated_index: int = 1,
         total_sections: int = 1,
     ) -> str:
-        """小节写入前质量门禁：程序复评→结构化反馈给 AI→保留最高分版本。"""
-        citations = getattr(project, "citations", [])
-        best_content = content
-        best_report = QualityService.section_quality_report(section_title, content, target_words=target_words, citations=citations)
-        if bool(best_report.get("passed")):
-            return content
-
-        max_rounds = 2
-        current_content = content
-        for round_index in range(1, max_rounds + 1):
-            issue_lines = [f"- {item}" for item in best_report.get("revision_instructions", [])[:8]]
-            issue_summary = "\n".join(issue_lines) or "正文质量不足，请按证据绑定、反幻觉和出版级表达规则修订。"
-            rewrite_prompt = self._build_quality_rewrite_prompt(
-                prompt=prompt,
-                section_title=section_title,
-                content=current_content,
-                target_words=target_words,
-                issue_summary=issue_summary,
-            )
-            if content_callback:
-                content_callback(f"_质量门禁发现风险，正在第 {round_index}/{max_rounds} 次定向修订并保留最佳版本..._", section_title, generated_index, total_sections)
-            try:
-                rewritten = self.llm_client.generate_content(
-                    rewrite_prompt,
-                    max_tokens=max(1800, min(14000, int(max(target_words, 600) * 3.0))),
-                    temperature=0.32,
-                )
-                rewritten = self._strip_duplicate_heading(self._sanitize_model_output(rewritten, section_title), section_title)
-                if not self._has_real_body_content(rewritten):
-                    self.logger.warning("Quality rewrite round %s for section %s returned no valid body.", round_index, section_title)
-                    break
-
-                candidate_report = QualityService.section_quality_report(section_title, rewritten, target_words=target_words, citations=citations)
-                if self._quality_report_rank(candidate_report) > self._quality_report_rank(best_report):
-                    best_content = rewritten
-                    best_report = candidate_report
-                    self._emit_content_callback(content_callback, best_content, section_title, target_words, generated_index, total_sections)
-                else:
-                    self.logger.warning("Quality rewrite round %s for section %s did not improve report; keeping current best.", round_index, section_title)
-                    break
-
-                if bool(best_report.get("passed")):
-                    break
-                current_content = best_content
-            except Exception as e:
-                self.logger.warning("Quality gate rewrite round %s failed for section %s: %s", round_index, section_title, e)
-                break
-        return best_content
+        # 无 Skill 时直接返回原内容
+        return content
 
     @staticmethod
     def _quality_report_rank(report: Dict[str, object]) -> tuple[int, int, int, int]:
-        """质量报告排序：先减少硬伤，再提高得分，再减少软警告，最后看字数接近度。"""
         hard = len(report.get("hard_failures", []) or [])
         soft = len(report.get("soft_warnings", []) or [])
         score = int(report.get("quality_score", 0) or 0)
@@ -840,7 +758,6 @@ class ChapterWriterAgent(Agent):
         target_words: int,
         issue_summary: str,
     ) -> str:
-        """构造小节质量门禁的定向重写提示。"""
         return f"""{prompt}
 
 ## 质量门禁发现的问题
@@ -862,49 +779,22 @@ class ChapterWriterAgent(Agent):
 9. 少用双引号，普通判断句和概念直接陈述；只保留直接引语、术语首次界定或特殊含义临时用法。
 """
 
-    def _estimate_output_tokens(self, text: str) -> int:
-        """估算一次生成正文的 completion tokens；优先使用 tiktoken，缺失时用保守字符启发式。"""
-        value = str(text or "")
-        if not value:
-            return 0
-        try:
-            import tiktoken  # type: ignore
-            encoding = tiktoken.get_encoding("cl100k_base")
-            return len(encoding.encode(value))
-        except Exception:
-            chinese = self._count_words(value)
-            ascii_chars = len(re.findall(r"[A-Za-z0-9]", value))
-            other_chars = max(0, len(value) - chinese - ascii_chars)
-            return max(1, int(chinese / 0.6) + int(ascii_chars / 4) + int(other_chars / 2))
-
-    def _last_completion_token_count(self, text: str) -> int:
-        """读取模型返回的 completion token；没有 usage 时退回本地估算。"""
-        completion_tokens = int(getattr(self.llm_client, "last_completion_tokens", 0) or 0)
-        total_tokens = int(getattr(self.llm_client, "last_total_tokens", 0) or 0)
-        if completion_tokens > 0:
-            return completion_tokens
-        if total_tokens > 0:
-            # 仅拿到 total_tokens 时不能直接当 completion 上限，但可作为保守历史样本。
-            return total_tokens
-        return self._estimate_output_tokens(text)
-
-    def _record_generation_history(self, history: List[Tuple[int, int]], text: str) -> None:
-        """记录当前尝试的 token 与中文字数历史；异常值直接忽略。"""
-        words = self._count_words(text)
-        tokens = self._last_completion_token_count(text)
-        if tokens > 0 and words > 0:
-            history.append((tokens, words))
-
-    def _estimate_token_cap(self, target_words: int, history: List[Tuple[int, int]], safety_factor: float = 0.9) -> int:
-        """根据历史中文字数/token 比估算 completion max_tokens。"""
-        ratios = [cw / tk for tk, cw in history if tk > 0 and cw > 0]
-        avg_ratio = sum(ratios) / len(ratios) if ratios else 0.6
-        avg_ratio = max(0.3, min(avg_ratio, 1.2))
-        estimated = int((max(1, target_words) / avg_ratio) * safety_factor)
-        return max(300, min(6000, estimated))
-
-    def _build_word_count_compress_prompt(self, content: str, prompt: str, target_words: int, current_words: int) -> str:
+    # ---------- 字数压缩 / 补写（硬编码 ±5%） ----------
+    def _build_word_count_compress_prompt(
+        self,
+        content: str,
+        prompt: str,
+        target_words: int,
+        current_words: int,
+        pressure_level: int = 1,
+    ) -> str:
         delete_words = max(1, current_words - target_words)
+        strict_upper = int(round(target_words * 1.05))
+        hard_upper = strict_upper
+        pressure_text = self._word_count_pressure_text(pressure_level, "compress")
+        countdown_prompt = self._countdown_marker_prompt(
+            target_words, chunk_size=50, mode="compress"
+        )
         return f"""{prompt}
 
 ## 已生成正文（系统统计后超出目标范围）
@@ -912,74 +802,24 @@ class ChapterWriterAgent(Agent):
 
 ## 系统字数裁判结果
 目标约 {target_words} 字；系统统计当前约 {current_words} 字；需要删约 {delete_words} 字。
+目标合格带：不高于 {strict_upper} 字；硬红线：不高于 {hard_upper} 字。
+
+## 压缩指令（只给你内部执行，禁止写进正文）
+{pressure_text}
+
+{countdown_prompt}
 
 ## 压缩任务
-【系统指令 - 最高优先级】
-
-你的唯一任务是极致压缩以下专著正文，使其字数严格降至目标范围。必须返回压缩后的完整正文，绝不输出删减说明、修改对照、过程分析或任何其他内容。不然没有任何收入，无法生存，无法照顾家庭和孩子。字数越少工资越高。
-
-【核心约束 - 绝对不可违反】
-1. 不新增任何事实、数据、引用或案例。
-2. 不新增任何原文没有的观点或论证。
-3. 不输出章节标题或小节标题。
-4. 不允许任何句子半途截断，每个句子必须完整结束。
-5. 压缩后必须是可直接使用的完整正文，不是碎片或要点罗列。
-
-【极致压缩原则】
-1. 大幅缩减：压缩后字数必须比原文显著减少，严格趋近目标字数。若原文1000字目标700字，不得只删到850字就交差。
-2. 长句精炼：将冗长的修饰从句改写为短句；删除重复的定语、状语。
-3. 合并同类：将表达相近意思的连续句子合并为一句；将并列列举压缩为概括性表述（如“A、B、C等方面”简化为“多个层面”）。
-4. 举例精选：原文如有多个例子，只保留最典型的一个，或完全删除例证只留结论。
-5. 背景极致浓缩：背景铺陈不得超出一句话，直接切入概念界定或问题分析。
-6. 删除所有无实质内容占位符：“需要指出的是”“值得注意的是”“如前所述”“从某种意义上说”“不可否认”“众所周知”等。
-
-【保留清单 - 必须保留，但需提炼】
-- 核心概念的定义（可合并解释性文字）
-- 论证链条的骨架（前提→推理→结论，去掉中间解释性插入语）
-- 实施路径的关键步骤（每个步骤用最简语言描述）
-- 风险边界和限定条件
-- 已有可追溯来源的结论或数据（但删除对来源的描述，只保留结论本身）
-
-【删除清单 - 必须彻底删除】
-- 重复铺陈（同一论点换说法多次出现）
-- 空泛过渡、背景渲染
-- 规划说明、写作思路、资料依据说明、证据边界说明、后续补充说明
-- 过度修饰的形容词和副词
-- 所有括号内的补充解释（除非是术语缩写界定）
-- 所有分号分隔的并列解释超过2项时，压缩为一项或概述
-
-【压缩操作指南（内部执行）】
-1. 首先用一句话浓缩原段落核心。
-2. 再将支持论述拆解为“论点-论据-结论”三层，每层只用1-2个短句。
-3. 最后检查有无冗余修饰、重复论证，有则删到骨。
-4. 确保逻辑不跳，直接输出最终精简版。
-
-【格式要求】
-1. 每段以两个全角空格开头。
-2. 按论证的自然转向分段，不追求段落长度整齐。
-3. 段落间以空行分隔。
-4. 段落数量不做硬性要求，但压缩后段落数可适度少于原文。
-
-【用词规范】
-- 普通判断句和概念直接陈述，不加双引号。
-- 表达拟定方案、办法时用“制订”而非“制定”。
-- 描述水平、程度变化时用“提高”而非“提升”。
-- 连接词不过度使用，能用句号断开就断开。
-
-【输出规则】
-- 输出即正文，第一个字符必须是空格或汉字，不允许有任何前缀。
-- 正文结束后直接结束，不允许有任何后缀、说明、标记。
-- 绝对禁止：字数统计、偏差率、自评、评分、修改说明、过程说明。
-
-【任务参数】
-- 当前字数：{{current_words}} 字
-- 目标字数：{{target_words}} 字
-- 只能少不能多
-
-请压缩以下原文：
----
-{{original_text}}
+请返回压缩后的完整正文，不要只返回删减说明。请在不新增事实、不新增引用、不输出标题的前提下精简冗余表述；不得截断半句话。
+要求：
+1. 保留核心概念、论证链条、实施路径、风险边界和已有可追溯来源。
+2. 删除重复铺陈、空泛过渡、规划说明和“写作思路/资料依据/证据边界/后续补充”等非正文内容。
+3. 少用双引号，普通判断句和概念直接陈述。
+4. 只输出压缩后的完整正文段落，每段以两个全角空格开头；可按论证自然转向分段，不要追求段落长度整齐。
+5. 不要输出字数统计、偏差率、自评、评分、修改说明或过程说明。
+6. 必须压缩到目标字数 ±5% 以内，不允许超过 {hard_upper} 字硬红线。
 """
+
     def generate_with_token_cap(
         self,
         prompt: str,
@@ -987,9 +827,14 @@ class ChapterWriterAgent(Agent):
         history: List[Tuple[int, int]],
         section_title: str = "",
     ) -> str:
-        """基于历史 token/中文字数比设置 completion max_tokens，只限制 API 参数，不把 token cap 写入提示词。"""
         max_tokens = self._estimate_token_cap(target_words, history, safety_factor=0.9)
-        self.logger.info("Token-capped word repair for section %s: target=%s max_tokens=%s history=%s", section_title, target_words, max_tokens, history)
+        self.logger.info(
+            "Token-capped word repair for section %s: target=%s max_tokens=%s history=%s",
+            section_title,
+            target_words,
+            max_tokens,
+            history,
+        )
         return self.llm_client.generate_content(
             prompt,
             max_tokens=max_tokens,
@@ -1007,33 +852,49 @@ class ChapterWriterAgent(Agent):
         content_callback=None,
         generated_index: int = 1,
         total_sections: int = 1,
+        pressure_level: int = 1,
     ) -> str:
-        """模型初稿明显超出目标字数时，先让模型保留论证骨架进行压缩。"""
-        if current_words <= max(1, int(target_words * 1.05)):
+        strict_upper = int(round(target_words * 1.05))
+        if current_words <= strict_upper:
             return content
-        compress_prompt = self._build_word_count_compress_prompt(content, prompt, target_words, current_words)
+        compress_prompt = self._build_word_count_compress_prompt(
+            content, prompt, target_words, current_words, pressure_level=pressure_level
+        )
         if content_callback:
-            content_callback("_字数超出目标范围，正在压缩正文..._", section_title, generated_index, total_sections)
+            content_callback(
+                "_字数超出目标范围，正在压缩正文..._",
+                section_title,
+                generated_index,
+                total_sections,
+            )
         try:
             compressed = self.llm_client.generate_content(
                 compress_prompt,
                 max_tokens=max(700, min(5000, int(target_words * 1.25))),
                 temperature=0.25,
             )
-            compressed = self._strip_duplicate_heading(self._sanitize_model_output(compressed, section_title), section_title)
-            compressed_words = self._count_words(compressed)
-            if self._has_real_body_content(compressed):
-                self._emit_content_callback(content_callback, compressed, section_title, target_words, generated_index, total_sections)
-                return compressed
-            self.logger.warning(
-                "Compression for section %s returned no valid body: before=%s after=%s target=%s; keeping current content for quality.",
-                section_title,
-                current_words,
-                compressed_words,
-                target_words,
+            compressed = self._strip_duplicate_heading(
+                self._sanitize_model_output(compressed, section_title), section_title
             )
+            compressed_words = self._count_words(compressed)
+            if (
+                self._has_real_body_content(compressed)
+                and self._word_count_delta_score(compressed_words, target_words)
+                < self._word_count_delta_score(current_words, target_words)
+            ):
+                self._emit_content_callback(
+                    content_callback,
+                    compressed,
+                    section_title,
+                    target_words,
+                    generated_index,
+                    total_sections,
+                )
+                return compressed
         except Exception as e:
-            self.logger.warning("Failed to compress section %s to target words: %s", section_title, e)
+            self.logger.warning(
+                "Failed to compress section %s to target words: %s", section_title, e
+            )
         return content
 
     def _expand_to_target_words(
@@ -1046,9 +907,15 @@ class ChapterWriterAgent(Agent):
         content_callback=None,
         generated_index: int = 1,
         total_sections: int = 1,
+        pressure_level: int = 1,
     ) -> str:
-        """模型初稿明显短于大纲字数时，由系统发令要求补足并返回完整正文。"""
         need_words = max(1, target_words - current_words)
+        strict_lower = int(round(target_words * 0.95))
+        hard_lower = strict_lower
+        pressure_text = self._word_count_pressure_text(pressure_level, "expand")
+        countdown_prompt = self._countdown_marker_prompt(
+            target_words, chunk_size=50, mode="expand"
+        )
         expand_prompt = f"""{prompt}
 
 ## 已生成正文（系统统计后低于目标范围）
@@ -1056,6 +923,12 @@ class ChapterWriterAgent(Agent):
 
 ## 系统字数裁判结果
 目标约 {target_words} 字；系统统计当前约 {current_words} 字；需要补约 {need_words} 字。
+目标合格带：不低于 {strict_lower} 字；硬红线：不低于 {hard_lower} 字。
+
+## 补写指令（只给你内部执行，禁止写进正文）
+{pressure_text}
+
+{countdown_prompt}
 
 ## 补写任务
 请返回补写后的完整正文，不要只返回追加段落。请在不重复已有内容、不输出标题的前提下，扩展论证的概念边界、机制分析、适用场景或风险条件。
@@ -1064,11 +937,17 @@ class ChapterWriterAgent(Agent):
 2. 只围绕当前小节写作思路补强论证，不新增无关分论点。
 3. 每段以两个全角空格开头；可按论证自然转向分段，不要追求段落长度整齐。
 4. 不要输出字数统计、偏差率、自评、评分、修改说明或过程说明。
-5. 只输出补写后的完整正文。"""
+5. 只输出补写后的完整正文。
+6. 必须补到目标字数 ±5% 以内，不允许低于 {hard_lower} 字硬红线。
+"""
         try:
             rewrite_chunks = []
             if hasattr(self.llm_client, "stream_content"):
-                for chunk in self.llm_client.stream_content(expand_prompt, max_tokens=max(1800, min(12000, int(max(need_words, target_words) * 4.0))), temperature=0.6):
+                for chunk in self.llm_client.stream_content(
+                    expand_prompt,
+                    max_tokens=max(1800, min(12000, int(max(need_words, target_words) * 4.0))),
+                    temperature=0.6,
+                ):
                     if chunk:
                         rewrite_chunks.append(str(chunk))
                         self._emit_content_callback(
@@ -1081,16 +960,29 @@ class ChapterWriterAgent(Agent):
                         )
                 rewritten = "".join(rewrite_chunks)
             else:
-                rewritten = self.llm_client.generate_content(expand_prompt, max_tokens=max(1800, min(12000, int(max(need_words, target_words) * 4.0))), temperature=0.6)
-            rewritten = self._strip_duplicate_heading(self._sanitize_model_output(rewritten, section_title), section_title)
-            if self._has_real_body_content(rewritten):
+                rewritten = self.llm_client.generate_content(
+                    expand_prompt,
+                    max_tokens=max(1800, min(12000, int(max(need_words, target_words) * 4.0))),
+                    temperature=0.6,
+                )
+            rewritten = self._strip_duplicate_heading(
+                self._sanitize_model_output(rewritten, section_title), section_title
+            )
+            rewritten_words = self._count_words(rewritten)
+            if (
+                self._has_real_body_content(rewritten)
+                and self._word_count_delta_score(rewritten_words, target_words)
+                < self._word_count_delta_score(current_words, target_words)
+            ):
                 return rewritten.strip()
         except Exception as e:
-            self.logger.warning("Failed to expand section %s to target words: %s", section_title, e)
+            self.logger.warning(
+                "Failed to expand section %s to target words: %s", section_title, e
+            )
         return base_content
 
+    # ---------- 尾句补全 ----------
     def _ends_with_sentence_terminal(self, content: str) -> bool:
-        """判断正文是否以完整句末结束；不完整时只追加续写，不裁剪原文。"""
         text = re.sub(r"[\s　]+$", "", str(content or ""))
         if not text:
             return True
@@ -1106,7 +998,6 @@ class ChapterWriterAgent(Agent):
         generated_index: int = 1,
         total_sections: int = 1,
     ) -> str:
-        """检测模型因输出预算中断的半句话；只向后续写补全，不删除、不改写已有正文。"""
         if self._ends_with_sentence_terminal(content):
             return content
         tail = str(content or "")[-300:]
@@ -1123,42 +1014,64 @@ class ChapterWriterAgent(Agent):
 3. 只输出断点之后应该追加的文字；第一字必须能直接接在原文末尾。
 4. 以完整句号、问号或感叹号结束。"""
         if content_callback:
-            content_callback("_检测到正文尾句未闭合，正在只追加续写补全..._", section_title, generated_index, total_sections)
+            content_callback(
+                "_检测到正文尾句未闭合，正在只追加续写补全..._",
+                section_title,
+                generated_index,
+                total_sections,
+            )
         try:
             addition = self.llm_client.generate_content(
                 completion_prompt,
                 max_tokens=max(1200, min(4000, int(max(target_words, 400) * 1.5))),
                 temperature=0.35,
             )
-            addition = self._strip_duplicate_heading(self._sanitize_model_output(addition, section_title), section_title)
+            addition = self._strip_duplicate_heading(
+                self._sanitize_model_output(addition, section_title), section_title
+            )
             if addition:
                 completed = str(content or "").rstrip() + str(addition).lstrip()
-                self._emit_content_callback(content_callback, completed, section_title, target_words, generated_index, total_sections)
+                self._emit_content_callback(
+                    content_callback,
+                    completed,
+                    section_title,
+                    target_words,
+                    generated_index,
+                    total_sections,
+                )
                 return completed
         except Exception as e:
-            self.logger.warning("Failed to complete truncated tail for section %s: %s", section_title, e)
+            self.logger.warning(
+                "Failed to complete truncated tail for section %s: %s", section_title, e
+            )
         return content
 
+    # ---------- 输出净化 ----------
     def _sanitize_model_output(self, content: str, section_title: str) -> str:
-        """清理模型异常输出，避免把供应商错误页/HTML 写进章节。"""
         if not content:
             return ""
         text = str(content).strip()
-        html_signals = ["<!doctype html", "<html", "</html>", "<head", "<body", "<title>", "<script", "<iframe", "HubLinuxDO"]
+        html_signals = [
+            "<!doctype html", "<html", "</html>", "<head", "<body", "<title>",
+            "<script", "<iframe", "HubLinuxDO",
+        ]
         lowered = text.lower()
         if any(signal.lower() in lowered for signal in html_signals):
             self.logger.warning("Invalid HTML/error-page response while writing %s", section_title)
             return ""
-        text = re.sub(r"```(?:html|xml|javascript|js)?\s*.*?</(?:html|body|script|iframe)>\s*```", "", text, flags=re.IGNORECASE | re.DOTALL)
+        text = re.sub(
+            r"```(?:html|xml|javascript|js)?\s*.*?</(?:html|body|script|iframe)>\s*```",
+            "",
+            text,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
         text = re.sub(r"(?im)^\s*Section\s+\d+\s*:\s*Write\s+this\s+chapter.*$", "", text)
         text = re.sub(r"(?is)<script.*?</script>|<iframe.*?</iframe>", "", text)
-        # 部分 OpenAI-compatible 中转会把 chat role 串入正文开头或行首，例如
-        # “assistantassistant 正文”“assistant: 正文”。这些不是正文内容，必须在所有
-        # 初稿、续写、重写、压缩和最终格式化阶段统一剥离。
         text = re.sub(r"(?im)^\s*(?:assistant\s*){1,4}[:：\-—\s]*", "", text)
         text = re.sub(r"(?im)^\s*(?:user|system)\s*[:：\-—]\s*", "", text)
         text = re.sub(r"(?i)(?<=\n)(?:assistant\s*){2,}(?=\S)", "", text)
         text = re.sub(r"(?i)^(?:assistant\s*){2,}(?=\S)", "", text)
+        # 预览阶段不删除倒计时标记，留给 _emit_content_callback 中可见
         return text.strip()
 
     def _strip_duplicate_heading(self, content: str, section_title: str) -> str:
@@ -1186,8 +1099,8 @@ class ChapterWriterAgent(Agent):
             break
         return "\n".join(lines).strip()
 
+    # ---------- 语言规范修正 ----------
     def _language_norm_issues(self, text: str) -> List[str]:
-        """检测用户指定的正文语言规范问题。"""
         content = str(text or "")
         issues: List[str] = []
         if "制定" in content:
@@ -1215,7 +1128,6 @@ class ChapterWriterAgent(Agent):
         generated_index: int = 1,
         total_sections: int = 1,
     ) -> str:
-        """按用户指定语言规范做确定性替换；复杂句法问题触发一次定向改写。"""
         content = str(text or "").strip()
         if not content:
             return ""
@@ -1238,20 +1150,39 @@ class ChapterWriterAgent(Agent):
 ## 待改写文本
 {normalized}"""
         if content_callback:
-            content_callback("_检测到语言规范问题，正在定向改写一次..._", section_title, generated_index, total_sections)
+            content_callback(
+                "_检测到语言规范问题，正在定向改写一次..._",
+                section_title,
+                generated_index,
+                total_sections,
+            )
         try:
             rewritten = self.llm_client.generate_content(
                 rewrite_prompt,
-                max_tokens=max(1200, min(12000, int(max(target_words, self._count_words(normalized), 400) * 2.5))),
+                max_tokens=max(
+                    1200,
+                    min(12000, int(max(target_words, self._count_words(normalized), 400) * 2.5)),
+                ),
                 temperature=0.2,
             )
-            rewritten = self._strip_duplicate_heading(self._sanitize_model_output(rewritten, section_title), section_title)
+            rewritten = self._strip_duplicate_heading(
+                self._sanitize_model_output(rewritten, section_title), section_title
+            )
             if self._has_real_body_content(rewritten):
                 rewritten = rewritten.replace("制定", "制订").replace("作出", "做出").replace("提升", "提高")
-                self._emit_content_callback(content_callback, rewritten, section_title, target_words or self._count_words(rewritten), generated_index, total_sections)
+                self._emit_content_callback(
+                    content_callback,
+                    rewritten,
+                    section_title,
+                    target_words or self._count_words(rewritten),
+                    generated_index,
+                    total_sections,
+                )
                 return rewritten
         except Exception as e:
-            self.logger.warning("Failed to rewrite language norms for section %s: %s", section_title, e)
+            self.logger.warning(
+                "Failed to rewrite language norms for section %s: %s", section_title, e
+            )
         return normalized
 
     def check_and_rewrite_quotes(
@@ -1263,7 +1194,6 @@ class ChapterWriterAgent(Agent):
         generated_index: int = 1,
         total_sections: int = 1,
     ) -> str:
-        """检测双引号密度；超过阈值时只调用模型做一次定向去引号改写。"""
         content = str(text or "").strip()
         if not content:
             return ""
@@ -1279,21 +1209,38 @@ class ChapterWriterAgent(Agent):
 ## 待改写文本
 {content}"""
         if content_callback:
-            content_callback("_检测到双引号过多，正在定向改写一次..._", section_title, generated_index, total_sections)
+            content_callback(
+                "_检测到双引号过多，正在定向改写一次..._",
+                section_title,
+                generated_index,
+                total_sections,
+            )
         try:
             rewritten = self.llm_client.generate_content(
                 rewrite_prompt,
                 max_tokens=max(1200, min(12000, int(max(target_words, char_count) * 2.5))),
                 temperature=0.25,
             )
-            rewritten = self._strip_duplicate_heading(self._sanitize_model_output(rewritten, section_title), section_title)
+            rewritten = self._strip_duplicate_heading(
+                self._sanitize_model_output(rewritten, section_title), section_title
+            )
             if self._has_real_body_content(rewritten):
-                self._emit_content_callback(content_callback, rewritten, section_title, target_words or char_count, generated_index, total_sections)
+                self._emit_content_callback(
+                    content_callback,
+                    rewritten,
+                    section_title,
+                    target_words or char_count,
+                    generated_index,
+                    total_sections,
+                )
                 return rewritten
         except Exception as e:
-            self.logger.warning("Failed to rewrite quotes for section %s: %s", section_title, e)
+            self.logger.warning(
+                "Failed to rewrite quotes for section %s: %s", section_title, e
+            )
         return content
 
+    # ---------- 字数闭环修复 ----------
     def _repair_word_count_loop(
         self,
         content: str,
@@ -1304,19 +1251,23 @@ class ChapterWriterAgent(Agent):
         generated_index: int = 1,
         total_sections: int = 1,
     ) -> str:
-        """系统统计中文字数：两轮 AI 协商修正后，严重超标时追加一次 token 上限压缩；不做代码裁剪。"""
         if not content or not target_words:
             return content or ""
         repaired = str(content).strip()
         history: List[Tuple[int, int]] = []
         self._record_generation_history(history, repaired)
-        strict_lower = max(1, int(target_words * 0.95))
-        strict_upper = max(strict_lower + 1, int(target_words * 1.05))
-        final_lower = max(1, int(target_words * 0.92))
-        final_upper = max(final_lower + 1, int(target_words * 1.08))
-        soft_upper = max(final_upper + 1, int(target_words * 1.15))
+
+        strict_lower = int(round(target_words * 0.95))
+        strict_upper = int(round(target_words * 1.05))
+        hard_lower = strict_lower
+        hard_upper = strict_upper
+        max_rounds = 2
+
         last_compress_prompt = ""
-        for round_index in range(2):
+        best_text = repaired
+        best_score = self._word_count_delta_score(self._count_words(repaired), target_words)
+
+        for round_index in range(max_rounds):
             current_words = self._count_words(repaired)
             if strict_lower <= current_words <= strict_upper:
                 break
@@ -1330,6 +1281,7 @@ class ChapterWriterAgent(Agent):
                     content_callback=content_callback,
                     generated_index=generated_index,
                     total_sections=total_sections,
+                    pressure_level=round_index + 1,
                 )
             else:
                 last_compress_prompt = self._build_word_count_compress_prompt(
@@ -1337,6 +1289,7 @@ class ChapterWriterAgent(Agent):
                     prompt=prompt,
                     target_words=target_words,
                     current_words=current_words,
+                    pressure_level=round_index + 1,
                 )
                 next_text = self._compress_to_target_words(
                     content=repaired,
@@ -1347,59 +1300,111 @@ class ChapterWriterAgent(Agent):
                     content_callback=content_callback,
                     generated_index=generated_index,
                     total_sections=total_sections,
+                    pressure_level=round_index + 1,
                 )
-            next_text = self._strip_duplicate_heading(self._sanitize_model_output(next_text, section_title), section_title)
+            next_text = self._strip_duplicate_heading(
+                self._sanitize_model_output(next_text, section_title), section_title
+            )
             if self._has_real_body_content(next_text):
                 self._record_generation_history(history, next_text)
             if not self._has_real_body_content(next_text) or next_text.strip() == repaired.strip():
                 break
             repaired = next_text.strip()
             repaired_words = self._count_words(repaired)
+            repaired_score = self._word_count_delta_score(repaired_words, target_words)
+            if repaired_score < best_score:
+                best_text = repaired
+                best_score = repaired_score
             if strict_lower <= repaired_words <= strict_upper:
                 break
-            if round_index == 1 and final_lower <= repaired_words <= final_upper:
-                self.logger.info(
-                    "Word count repair accepted within final tolerance for section %s: current=%s target=%s",
-                    section_title,
-                    repaired_words,
-                    target_words,
-                )
-                break
 
+        if self._word_count_delta_score(self._count_words(repaired), target_words) > best_score:
+            repaired = best_text
         final_words = self._count_words(repaired)
-        if final_words > final_upper:
+
+        # 最终仍低于硬红线：再强制扩展一次
+        if final_words < hard_lower:
+            intensified = self._expand_to_target_words(
+                base_content=repaired,
+                prompt=prompt,
+                section_title=section_title,
+                target_words=target_words,
+                current_words=final_words,
+                content_callback=content_callback,
+                generated_index=generated_index,
+                total_sections=total_sections,
+                pressure_level=max_rounds,
+            )
+            intensified = self._strip_duplicate_heading(
+                self._sanitize_model_output(intensified, section_title), section_title
+            )
+            intensified_words = self._count_words(intensified)
+            if (
+                self._has_real_body_content(intensified)
+                and self._word_count_delta_score(intensified_words, target_words)
+                < self._word_count_delta_score(final_words, target_words)
+            ):
+                repaired = intensified.strip()
+                final_words = intensified_words
+                self._emit_content_callback(
+                    content_callback,
+                    repaired,
+                    section_title,
+                    target_words,
+                    generated_index,
+                    total_sections,
+                )
+        # 最终仍高于硬红线：用 token 硬限制压缩
+        if final_words > hard_upper:
             token_prompt = last_compress_prompt or self._build_word_count_compress_prompt(
                 content=repaired,
                 prompt=prompt,
                 target_words=target_words,
                 current_words=final_words,
+                pressure_level=max_rounds,
             )
-            capped = self.generate_with_token_cap(token_prompt, target_words, history, section_title=section_title)
-            capped = self._strip_duplicate_heading(self._sanitize_model_output(capped, section_title), section_title)
-            if self._has_real_body_content(capped):
+            capped = self.generate_with_token_cap(
+                token_prompt, target_words, history, section_title=section_title
+            )
+            capped = self._strip_duplicate_heading(
+                self._sanitize_model_output(capped, section_title), section_title
+            )
+            capped_words = self._count_words(capped)
+            if (
+                self._has_real_body_content(capped)
+                and self._word_count_delta_score(capped_words, target_words)
+                < self._word_count_delta_score(final_words, target_words)
+            ):
                 self._record_generation_history(history, capped)
                 repaired = capped.strip()
-                final_words = self._count_words(repaired)
-                self._emit_content_callback(content_callback, repaired, section_title, target_words, generated_index, total_sections)
+                final_words = capped_words
+                self._emit_content_callback(
+                    content_callback,
+                    repaired,
+                    section_title,
+                    target_words,
+                    generated_index,
+                    total_sections,
+                )
 
-        if final_words > soft_upper:
+        # 软失败标记（不阻塞）
+        if not (hard_lower <= final_words <= hard_upper):
             self.logger.warning(
-                "Word count repair still severely over limit for section %s: current=%s target=%s; marking soft fail and keeping AI generated text.",
+                "Word count repair still outside hard range for section %s: final=%s target=%s",
                 section_title,
                 final_words,
                 target_words,
             )
         return repaired
 
+    # ---------- 段落整形 ----------
     def _split_sentences(self, text: str) -> List[str]:
-        """按完整句切分；只作为段落安全重组依据，不在句中截断。"""
         clean = re.sub(r"\s*\n\s*", "", str(text or "").strip())
         if not clean:
             return []
         return [s.strip() for s in re.split(r"(?<=[。！？；.!?;])", clean) if s.strip()]
 
     def enforce_paragraph_shape(self, text: str) -> str:
-        """语义安全分段：每段至少五句，不按字数均分正文。"""
         content = self._strip_duplicate_heading(text, "")
         content = re.sub(r"\n{3,}", "\n\n", str(content or "").strip())
         if not content:
@@ -1407,7 +1412,10 @@ class ChapterWriterAgent(Agent):
 
         min_sentences_per_paragraph = 5
         raw_paragraphs = [p.strip() for p in re.split(r"\n\s*\n", content) if p.strip()]
-        if 2 <= len(raw_paragraphs) <= 3 and all(len(self._split_sentences(p)) >= min_sentences_per_paragraph for p in raw_paragraphs):
+        if (
+            2 <= len(raw_paragraphs) <= 3
+            and all(len(self._split_sentences(p)) >= min_sentences_per_paragraph for p in raw_paragraphs)
+        ):
             return "\n\n".join(raw_paragraphs).strip()
 
         sentences = self._split_sentences(content)
@@ -1418,7 +1426,7 @@ class ChapterWriterAgent(Agent):
             "与此同时", "进一步看", "不过", "因此", "然而", "从实践层面", "从技术层面",
             "从制度层面", "相较而言", "由此", "换言之", "另一方面", "更重要的是",
             "在这一背景下", "基于此", "反过来看", "具体而言", "与此不同", "在风险层面",
-            "从治理角度", "从应用场景看", "问题在于", "这种变化意味着"
+            "从治理角度", "从应用场景看", "问题在于", "这种变化意味着",
         )
         candidates: list[int] = []
         for idx in range(min_sentences_per_paragraph, len(sentences) - min_sentences_per_paragraph + 1):
@@ -1432,7 +1440,6 @@ class ChapterWriterAgent(Agent):
         if not candidates:
             return "".join(sentences).strip()
 
-        # 选择最靠近语义转折的自然切点，同时避免精确二等分带来的机械平均感。
         preferred = len(sentences) * 0.58
         split_at = min(candidates, key=lambda value: abs(value - preferred))
         first = "".join(sentences[:split_at]).strip()
@@ -1445,11 +1452,9 @@ class ChapterWriterAgent(Agent):
         return f"{first}\n\n{second}".strip()
 
     def _enforce_paragraph_shape(self, content: str, target_words: int = 0) -> str:
-        """兼容旧调用名，实际使用安全分段策略。"""
         return self.enforce_paragraph_shape(content)
 
     def _shape_preview_content(self, content: str, section_title: str, target_words: int) -> str:
-        """实时预览也做段落整形，避免流式输出阶段显示三四句话一段。"""
         text = self._sanitize_model_output(content, section_title)
         text = self._strip_duplicate_heading(text, section_title) if text else ""
         return self._enforce_paragraph_shape(text, target_words)
@@ -1469,38 +1474,53 @@ class ChapterWriterAgent(Agent):
         if text.lstrip().startswith("_"):
             content_callback(text, section_title, generated_index, total_sections)
             return
-        text = self.check_and_rewrite_language_norms(text, section_title=section_title, target_words=target_words)
-        content_callback(self._shape_preview_content(text, section_title, target_words), section_title, generated_index, total_sections)
+        # 预览阶段保留倒计时标记，不做删除
+        text = self.check_and_rewrite_language_norms(
+            text, section_title=section_title, target_words=target_words
+        )
+        content_callback(
+            self._shape_preview_content(text, section_title, target_words),
+            section_title,
+            generated_index,
+            total_sections,
+        )
 
     def _ensure_fullwidth_paragraph_indent(self, content: str) -> str:
-        """保证每个正文自然段首行两个全角空格，不处理 Markdown 标题。"""
-        paragraphs = [p.strip() for p in re.split(r"\n\s*\n", str(content or "").strip()) if p.strip()]
+        paragraphs = [
+            p.strip() for p in re.split(r"\n\s*\n", str(content or "").strip()) if p.strip()
+        ]
         formatted: list[str] = []
         for paragraph in paragraphs:
             if paragraph.startswith("#") or paragraph.lstrip().startswith("_"):
                 formatted.append(paragraph)
             else:
                 formatted.append("　　" + paragraph.lstrip("　 "))
-        # 不能使用 str.strip()：Python 会把全角空格也当作空白剥离，导致首段缩进丢失。
         return "\n\n".join(formatted).strip("\r\n ")
 
-    def _finalize_section_content(self, content: str, section_title: str, target_words: int) -> str:
-        """小节写入/预览前只做格式规范：去标题、合段、保留首行缩进；不按字数裁剪正文。"""
+    def _finalize_section_content(
+        self, content: str, section_title: str, target_words: int
+    ) -> str:
         text = self._sanitize_model_output(content, section_title)
         text = self._strip_duplicate_heading(text, section_title) if text else ""
-        text = self.check_and_rewrite_language_norms(text, section_title=section_title, target_words=target_words)
+        text = self.check_and_rewrite_language_norms(
+            text, section_title=section_title, target_words=target_words
+        )
         text = self._enforce_paragraph_shape(text, target_words)
+        # 最终写入正文前清除倒计时标记
+        text = self._strip_countdown_markers(text)
         return self._ensure_fullwidth_paragraph_indent(text)
 
     def _count_words(self, text: str) -> int:
-        """正文篇幅校验只统计汉字，避免标点、空格和英文编号干扰。"""
         return len(re.findall(r"[\u4e00-\u9fff]", text or ""))
 
     def _has_real_body_content(self, content: str) -> bool:
-        """判断生成结果中是否有真实正文，避免只写入标题或错误占位。"""
         if not content or not str(content).strip():
             return False
-        body_lines = [line.strip() for line in str(content).splitlines() if line.strip() and not line.strip().startswith("#")]
+        body_lines = [
+            line.strip()
+            for line in str(content).splitlines()
+            if line.strip() and not line.strip().startswith("#")
+        ]
         body = "\n".join(body_lines).strip()
         if not body:
             return False
@@ -1508,25 +1528,38 @@ class ChapterWriterAgent(Agent):
         invalid_signals = ["<!doctype html", "<html", "</html>", "traceback", "error:", "生成失败"]
         return not any(signal in lowered for signal in invalid_signals)
 
-    def _write_legacy_scene_chapter(self, project_knowledge_base: ProjectKnowledgeBase, chapter_number: int, chapter: Chapter) -> str:
-        """旧版小说场景写作逻辑：仅在没有 academic sections 时启用。"""
+    # ---------- 旧版场景写作兼容 ----------
+    def _write_legacy_scene_chapter(
+        self,
+        project_knowledge_base: ProjectKnowledgeBase,
+        chapter_number: int,
+        chapter: Chapter,
+    ) -> str:
         if not chapter.scenes:
-            console.print(f"[yellow]No sections/scenes found for Chapter {chapter_number}. Creating a fallback writing unit.[/yellow]")
+            console.print(
+                f"[yellow]No sections/scenes found for Chapter {chapter_number}. Creating a fallback writing unit.[/yellow]"
+            )
             default_scene = Scene(
                 scene_number=1,
                 summary=chapter.summary or "Write this chapter as an academic chapter.",
                 characters=[],
                 setting="",
                 goal="Complete the chapter",
-                emotional_beat=""
+                emotional_beat="",
             )
             chapter.scenes.append(default_scene)
 
         ordered_scenes = sorted(chapter.scenes, key=lambda s: s.scene_number)
         scene_contents = []
         for scene in ordered_scenes:
-            console.print("[cyan]Creating fallback section %d of %d...[/cyan]" % (scene.scene_number, len(ordered_scenes)))
-            scene_title = f"Section {scene.scene_number}: {scene.summary[:30]}..." if len(scene.summary) > 30 else f"Section {scene.scene_number}: {scene.summary}"
+            console.print(
+                f"[cyan]Creating fallback section {scene.scene_number} of {len(ordered_scenes)}...[/cyan]"
+            )
+            scene_title = (
+                f"Section {scene.scene_number}: {scene.summary[:30]}..."
+                if len(scene.summary) > 30
+                else f"Section {scene.scene_number}: {scene.summary}"
+            )
             scene_prompt = prompts.SCENE_PROMPT.format(
                 chapter_number=chapter_number,
                 chapter_title=chapter.title,
@@ -1541,16 +1574,29 @@ class ChapterWriterAgent(Agent):
                 setting=scene.setting if scene.setting else "None specified",
                 goal=scene.goal if scene.goal else "None specified",
                 emotional_beat=scene.emotional_beat if scene.emotional_beat else "None specified",
-                total_scenes=len(ordered_scenes)
+                total_scenes=len(ordered_scenes),
             )
-            scene_prompt = f"{ACADEMIC_MONOGRAPH_SYSTEM_PROMPT}\n\n{scene_prompt}\n\n请按学术专著强制规范生成本写作单元正文。每个自然段必须以两个全角空格开头，不输出HTML/XML/JS/代码/注释/指令残留；不得编造数据、案例、文献、法规、标准编号、人名、机构名、时间、地点；不得输出‘请搜索’‘请查询’‘详见某网页’等虚假操作表述；信息不足时必须明确写出‘【信息缺失】需要您提供……’。"
+            scene_prompt = (
+                f"{ACADEMIC_MONOGRAPH_SYSTEM_PROMPT}\n\n{scene_prompt}\n\n"
+                "请按学术专著强制规范生成本写作单元正文。每个自然段必须以两个全角空格开头，"
+                "不输出HTML/XML/JS/代码/注释/指令残留；不得编造数据、案例、文献、法规、标准编号、人名、机构名、时间、地点；"
+                "不得输出‘请搜索’‘请查询’‘详见某网页’等虚假操作表述；信息不足时必须明确写出‘【信息缺失】需要您提供……’。"
+            )
             scene_content = self.llm_client.generate_content(scene_prompt, max_tokens=3000)
             if not scene_content:
                 scene_content = f"[{scene_title} content unavailable]"
-            if not scene_content.startswith(f"**{scene_title}**") and not scene_content.startswith(f"# {scene_title}"):
+            if not scene_content.startswith(f"**{scene_title}**") and not scene_content.startswith(
+                f"# {scene_title}"
+            ):
                 scene_content = f"**{scene_title}**\n\n{scene_content}"
             scene_contents.append(scene_content)
 
-        legacy_text = f"# {format_chapter_label(chapter_number, chapter.title)}\n\n" + "\n\n".join(scene_contents) + "\n"
-        legacy_text, _, _ = finalize_academic_chapter(legacy_text, target_words=getattr(chapter, "word_count", 0) or 0)
+        legacy_text = (
+            f"# {format_chapter_label(chapter_number, chapter.title)}\n\n"
+            + "\n\n".join(scene_contents)
+            + "\n"
+        )
+        legacy_text, _, _ = finalize_academic_chapter(
+            legacy_text, target_words=getattr(chapter, "word_count", 0) or 0
+        )
         return legacy_text
