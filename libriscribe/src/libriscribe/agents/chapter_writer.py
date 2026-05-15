@@ -267,6 +267,298 @@ class ChapterWriterAgent(Agent):
     def _word_count_pressure_text(self, pressure_level: int, mode: str) -> str:
         return "按系统统计结果修正正文篇幅，禁止把修订过程写进正文。"
 
+    # ---------- 核心章节生成方法 ----------
+    def _write_academic_chapter(
+        self,
+        project_knowledge_base: ProjectKnowledgeBase,
+        chapter_number: int,
+        chapter: Chapter,
+        section_number: Optional[str] = None,
+        progress_callback=None,
+        content_callback=None,
+        chapter_strength_prompt: str = "",
+    ) -> str:
+        """按四级目录写作单元生成学术专著章节；传入 section_number 时仅生成指定小节。
+
+        有子节的小节（如 1.1 有 1.1.1/1.1.2 子节）只输出标题作为结构标记，
+        不单独生成内容；只有叶子节点（最深层无子节的小节）才调用 AI 生成正文。
+        """
+        all_sections = sorted(
+            chapter.sections,
+            key=lambda s: [int(p) if p.isdigit() else 0 for p in s.section_number.split(".")]
+        )
+
+        section_numbers = {sec.section_number for sec in all_sections}
+
+        def _is_leaf(sec):
+            sn = sec.section_number
+            for other_sn in section_numbers:
+                if other_sn != sn and other_sn.startswith(sn + "."):
+                    return False
+            return True
+
+        leaf_sections = [sec for sec in all_sections if _is_leaf(sec)]
+
+        if section_number:
+            ordered_sections = [sec for sec in all_sections if sec.section_number == section_number]
+            if not ordered_sections:
+                raise ValueError(f"Section {section_number} not found in chapter {chapter_number}.")
+            if not _is_leaf(ordered_sections[0]):
+                target_prefix = section_number + "."
+                ordered_sections = [sec for sec in leaf_sections if sec.section_number.startswith(target_prefix)]
+                if not ordered_sections:
+                    ordered_sections = []  # 没有叶子子节，只输出标题
+        else:
+            ordered_sections = leaf_sections
+
+        terminology = project_knowledge_base.get_terminology_context()
+        previous_summaries = project_knowledge_base.get_previous_summaries(chapter_number)
+        outline_tree = "\n".join(
+            f"{'  ' * (max(getattr(sec, 'level', 1) - 1, 0))}- {self.format_outline_section_label(sec.section_number, sec.title)}"
+            for sec in all_sections
+        )
+
+        content_parts = [f"# {format_chapter_label(chapter_number, chapter.title)}".strip(), ""]
+        generated_summaries = []
+        target_numbers = {sec.section_number for sec in ordered_sections}
+        target_total_words = (
+            int(getattr(chapter, "word_count", 0) or 0)
+            or sum(int(getattr(sec, "word_count", 0) or 0) for sec in ordered_sections)
+            or max(800 * max(len(ordered_sections), 1), 4000)
+        )
+        rhythm_targets = self.distribute_word_targets(
+            [self.format_outline_section_label(sec.section_number, sec.title) for sec in ordered_sections],
+            target_total_words,
+        )
+        rhythm_target_by_number = {
+            sec.section_number: rhythm_targets[idx]
+            for idx, sec in enumerate(ordered_sections)
+            if idx < len(rhythm_targets)
+        }
+        generated_index = 0
+        generated_actual_total = 0
+        generated_target_total = 0
+
+        # 按目录顺序输出：结构标题 -> 其下叶子小节正文
+        for section in all_sections:
+            level = max(1, min(getattr(section, "level", 1), 3))
+            markdown_level = "#" * (level + 1)
+            section_title = self.format_outline_section_label(section.section_number, section.title)
+
+            if not _is_leaf(section):
+                if (
+                    not section_number
+                    or section.section_number == section_number
+                    or section.section_number.startswith((section_number or "") + ".")
+                    or (section_number and section_number.startswith(section.section_number + "."))
+                ):
+                    content_parts.append(f"{markdown_level} {section_title}\n")
+                continue
+
+            if section.section_number not in target_numbers:
+                continue
+
+            generated_index += 1
+            base_target_words = rhythm_target_by_number.get(
+                section.section_number
+            ) or getattr(section, "word_count", 0) or max(800, int((getattr(chapter, "word_count", 0) or 4000) / max(len(ordered_sections), 1)))
+            target_words = base_target_words
+
+            # 动态平衡字数（不再依赖 Skill）
+            if not section_number:
+                remaining_sections = ordered_sections[generated_index - 1:]
+                remaining_words = max(1, int(target_total_words or 0) - int(generated_actual_total or 0))
+                remaining_titles = [
+                    self.format_outline_section_label(sec.section_number, sec.title)
+                    for sec in remaining_sections
+                ]
+                dynamic_targets = self.distribute_word_targets(remaining_titles, remaining_words)
+                target_words = dynamic_targets[0] if dynamic_targets else base_target_words
+                original_remaining_target = max(1, int(target_total_words or 0) - int(generated_target_total or 0))
+                if generated_actual_total > generated_target_total:
+                    self.logger.info(
+                        "Word rebalance before section %s: planned_so_far=%s actual_so_far=%s current_base=%s adjusted=%s remaining_words=%s",
+                        section_title,
+                        generated_target_total,
+                        generated_actual_total,
+                        base_target_words,
+                        target_words,
+                        remaining_words,
+                    )
+                target_words = max(1, min(int(target_words), original_remaining_target))
+
+            console.print(
+                f"[cyan]Writing academic section {generated_index}/{len(ordered_sections)}: {section_title}[/cyan]"
+            )
+
+            rag_context = self._get_rag_context(
+                getattr(section, "rag_query", "") or section.title or section_title,
+                project=project_knowledge_base,
+            )
+            prompt = self._build_academic_section_prompt(
+                project=project_knowledge_base,
+                chapter=chapter,
+                chapter_number=chapter_number,
+                section=section,
+                section_title=section_title,
+                target_words=target_words,
+                outline_tree=outline_tree,
+                terminology=terminology,
+                previous_summaries=previous_summaries,
+                rag_context=rag_context,
+                generated_summaries="\n".join(generated_summaries[-3:]),
+                chapter_strength_prompt=chapter_strength_prompt,
+            )
+
+            if progress_callback:
+                progress_callback(generated_index, len(ordered_sections), section_title, "start")
+
+            max_tokens = max(1800, min(16000, int(target_words * 3.0)))
+            section_content = self._generate_section_with_retries(
+                prompt=prompt,
+                section_title=section_title,
+                target_words=target_words,
+                max_tokens=max_tokens,
+                content_callback=content_callback,
+                progress_callback=progress_callback,
+                generated_index=generated_index,
+                total_sections=len(ordered_sections),
+            )
+
+            section_content = self._strip_duplicate_heading(
+                self._sanitize_model_output(section_content, section_title), section_title
+            )
+            if not section_content:
+                section.actual_word_count = 0
+                section.status = "failed"
+                if progress_callback:
+                    progress_callback(generated_index, len(ordered_sections), section_title, "failed_final")
+                raise RuntimeError(
+                    f"小节 {section_title} 连续重试后仍未获得有效正文。"
+                    "请检查当前模型是否拦截长提示、是否支持较大 max_tokens，或降低该小节目标字数后重试。"
+                )
+
+            # 引号密度控制
+            section_content = self.check_and_rewrite_quotes(
+                section_content,
+                section_title=section_title,
+                target_words=target_words,
+                content_callback=content_callback,
+                generated_index=generated_index,
+                total_sections=len(ordered_sections),
+            )
+            # 语言规范修正
+            section_content = self.check_and_rewrite_language_norms(
+                section_content,
+                section_title=section_title,
+                target_words=target_words,
+                content_callback=content_callback,
+                generated_index=generated_index,
+                total_sections=len(ordered_sections),
+            )
+            # 质量门禁（已移除 Skill，直接返回原内容）
+            section_content = self._quality_gate_section_content(
+                project=project_knowledge_base,
+                prompt=prompt,
+                section_title=section_title,
+                content=section_content,
+                target_words=target_words,
+                content_callback=content_callback,
+                generated_index=generated_index,
+                total_sections=len(ordered_sections),
+            )
+            # 尾句补全
+            section_content = self._complete_truncated_tail(
+                content=section_content,
+                prompt=prompt,
+                section_title=section_title,
+                target_words=target_words,
+                content_callback=content_callback,
+                generated_index=generated_index,
+                total_sections=len(ordered_sections),
+            )
+            # 字数闭环修复
+            section_content = self._repair_word_count_loop(
+                content=section_content,
+                prompt=prompt,
+                section_title=section_title,
+                target_words=target_words,
+                content_callback=content_callback,
+                generated_index=generated_index,
+                total_sections=len(ordered_sections),
+            )
+            section_content = self._finalize_section_content(section_content, section_title, target_words)
+
+            actual_words = self._count_words(section_content)
+            section.actual_word_count = actual_words
+            section.word_count_target = int(target_words or 0)
+            section.word_count_actual = actual_words
+            generated_actual_total += int(actual_words or 0)
+            generated_target_total += int(target_words or 0)
+
+            # 字数状态标记
+            strict_lower = int(round(target_words * 0.95))
+            strict_upper = int(round(target_words * 1.05))
+            if not (strict_lower <= actual_words <= strict_upper):
+                section.status = "word_count_soft_fail"
+                section.word_count_status = "word_count_soft_fail"
+                section.word_count_note = (
+                    f"目标 {target_words} 字，当前约 {actual_words} 字；已进行多轮补写/压缩，"
+                    "仍未进入硬红线。正文已保留最佳版本并建议人工复核。"
+                )
+                self.logger.warning(
+                    "Section %s marked word_count_soft_fail: target=%s actual=%s",
+                    section_title,
+                    target_words,
+                    actual_words,
+                )
+            else:
+                section.status = "completed"
+                section.word_count_status = "ok"
+                section.word_count_note = ""
+
+            generated_summaries.append(f"{section_title}: {section_content[:240]}")
+            content_parts.append(f"{markdown_level} {section_title}\n\n{section_content.strip()}\n")
+
+            if content_callback:
+                content_callback(section_content, section_title, generated_index, len(ordered_sections))
+            if progress_callback:
+                progress_callback(generated_index, len(ordered_sections), section_title, "completed")
+
+        if not section_number:
+            chapter.sections = all_sections
+            content_parts.extend(
+                [
+                    "",
+                    self._build_chapter_back_matter(
+                        project_knowledge_base, chapter, chapter_number, content_parts, terminology
+                    ),
+                ]
+            )
+        else:
+            updated = {sec.section_number: sec for sec in ordered_sections}
+            chapter.sections = [updated.get(sec.section_number, sec) for sec in all_sections]
+
+        chapter_text = "\n".join(content_parts).strip() + "\n"
+        if not section_number:
+            target_words = getattr(chapter, "word_count", 0) or sum(
+                getattr(sec, "word_count", 0) or 0 for sec in getattr(chapter, "sections", [])
+            )
+            chapter_text, score_total, verdict = finalize_academic_chapter(chapter_text, target_words=target_words)
+            if score_total < 40:
+                self.logger.warning(
+                    "Chapter %s self-assessment below 80 (%s/50): %s. Applying deterministic formatting rewrite once.",
+                    chapter_number,
+                    score_total,
+                    verdict,
+                )
+                chapter_text, _, _ = finalize_academic_chapter(
+                    ensure_fullwidth_indent(chapter_text), target_words=target_words
+                )
+        else:
+            chapter_text = ensure_fullwidth_indent(chapter_text)
+        return chapter_text
+
     # ---------- 提示词构建 ----------
     def _build_academic_section_prompt(
         self,
@@ -727,7 +1019,7 @@ class ChapterWriterAgent(Agent):
 8. 如果资料不足，用“【信息缺失】需要您提供……”说明缺口，但仍需完成基于通用知识的审慎论述。
 """
 
-    # ---------- 质量门禁（已移除 WritingSkill，但保留基础架构） ----------
+    # ---------- 质量门禁（已移除 Skill，直接返回原内容） ----------
     def _quality_gate_section_content(
         self,
         project: ProjectKnowledgeBase,
